@@ -19,3 +19,5 @@ before_fork do |_server, _worker|
     initialized = true
   end
 end
+
+listen "[::]:8080"
