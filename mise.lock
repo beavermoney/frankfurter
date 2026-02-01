@@ -1,0 +1,8 @@
+[[tools.ruby]]
+version = "3.4.8"
+backend = "core:ruby"
+"platforms.linux-arm64" = { checksum = "sha256:57d72d870437750268005360e40d78813b532a9042c88f34d0fb570d58df797c", url = "https://github.com/jdx/ruby/releases/download/3.4.8/ruby-3.4.8.arm64_linux.tar.gz"}
+"platforms.linux-x64" = { checksum = "sha256:98966a0acb3280b41878a5dcd1c43bc1c44c82988f9e54d64c303248040ad2f4", url = "https://github.com/jdx/ruby/releases/download/3.4.8/ruby-3.4.8.x86_64_linux.tar.gz"}
+"platforms.macos-arm64" = { checksum = "sha256:f2e7d0ea703977a322936e908c07eca36cefb488b58ef35c689e9f109fb2939f", url = "https://github.com/jdx/ruby/releases/download/3.4.8/ruby-3.4.8.macos.tar.gz"}
+"platforms.macos-x64" = { checksum = "sha256:53c4ddad41fbb6189f1f5ee0db57a51d54bd1f87f8755b3d68604156a35b045b", url = "https://cache.ruby-lang.org/pub/ruby/3.4/ruby-3.4.8.tar.gz"}
+"platforms.windows-x64" = { checksum = "sha256:53c4ddad41fbb6189f1f5ee0db57a51d54bd1f87f8755b3d68604156a35b045b", url = "https://cache.ruby-lang.org/pub/ruby/3.4/ruby-3.4.8.tar.gz"}
