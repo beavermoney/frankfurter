@@ -21,15 +21,15 @@ jobs:
           bundler-cache: true
       - run: bundle exec rake
 
-  publish:
-    needs: test
-    if: ${{ github.event_name == 'push' }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: elgohr/Publish-Docker-Github-Action@v5
-        with:
-          name: lineofflight/frankfurter
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-          tag_names: true
+  # publish:
+  #   needs: test
+  #   if: ${{ github.event_name == 'push' }}
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v6
+  #     - uses: elgohr/Publish-Docker-Github-Action@v5
+  #       with:
+  #         name: lineofflight/frankfurter
+  #         username: ${{ secrets.DOCKER_USERNAME }}
+  #         password: ${{ secrets.DOCKER_PASSWORD }}
+  #         tag_names: true
