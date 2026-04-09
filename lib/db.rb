@@ -2,4 +2,19 @@
 
 require "sequel"
 
-Sequel.connect("sqlite://#{Dir.pwd}/db/frankfurter.sqlite3")
+url = ENV.fetch("DATABASE_URL") do
+  env = ENV["APP_ENV"]
+  db_name = env ? "frankfurter_#{env}" : "frankfurter"
+  "sqlite://#{Dir.pwd}/db/#{db_name}.sqlite3"
+end
+
+unless url.start_with?("sqlite")
+  abort "Frankfurter now uses SQLite. Remove DATABASE_URL or set it to a sqlite URL."
+end
+
+DB = Sequel.connect(url)
+DB.run("PRAGMA journal_mode=WAL")
+DB.run("PRAGMA busy_timeout=5000")
+DB.run("PRAGMA synchronous=NORMAL")
+DB.run("PRAGMA mmap_size=134217728")
+DB.run("PRAGMA journal_size_limit=27103364")

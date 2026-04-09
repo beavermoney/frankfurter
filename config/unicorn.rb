@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-%x(rake db:prepare)
+%x(bundle exec rake db:setup)
 
 worker_process_count = (ENV["WORKER_PROCESSES"] || 4).to_i
 

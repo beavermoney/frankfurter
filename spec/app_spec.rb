@@ -10,12 +10,19 @@ describe App do
   let(:app) { App.freeze }
   let(:headers) { last_response.headers }
 
+  it "serves root" do
+    get "/"
+
+    _(last_response).must_be(:ok?)
+    _(headers["Cache-Control"]).must_equal("public, max-age=86400")
+  end
+
   it "serves static files" do
-    ["/", "/favicon.ico", "/robots.txt", "/v1/openapi.json"].each do |path|
+    ["/favicon.ico", "/robots.txt", "/v1/openapi.json"].each do |path|
       get path
 
       _(last_response).must_be(:ok?)
-      _(headers["Cache-Control"]).must_equal("public, max-age=900")
+      _(headers["Cache-Control"]).must_equal("public, max-age=86400")
     end
   end
 
@@ -36,7 +43,7 @@ describe App do
   end
 
   it "allows cross-origin requests" do
-    ["/v1/", "/v1/latest", "/v1/2012-11-20"].each do |path|
+    ["/v1/", "/v1/latest", "/v1/#{Fixtures.latest_date - 30}"].each do |path|
       header "Origin", "*"
       get path
 
@@ -45,7 +52,7 @@ describe App do
   end
 
   it "responds to preflight requests" do
-    ["/v1/", "/v1/latest", "/v1/2012-11-20"].each do |path|
+    ["/v1/", "/v1/latest", "/v1/#{Fixtures.latest_date - 30}"].each do |path|
       header "Origin", "*"
       header "Access-Control-Request-Method", "GET"
       header "Access-Control-Request-Headers", "Content-Type"

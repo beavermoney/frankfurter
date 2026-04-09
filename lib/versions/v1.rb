@@ -3,9 +3,10 @@
 require "oj"
 require "roda"
 
-require "currency_names"
-require "query"
-require "quote"
+require "versions/v1/currency_names"
+require "versions/v1/query"
+require "versions/v1/quote/end_of_day"
+require "versions/v1/quote/interval"
 
 module Versions
   class V1 < Roda
@@ -22,7 +23,7 @@ module Versions
     end
 
     route do |r|
-      response.cache_control(public: true, max_age: 900)
+      response.cache_control(public: true, max_age: 86400)
 
       r.is(/latest|current/) do
         r.params["date"] = Date.today.to_s

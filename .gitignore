@@ -1,6 +1,9 @@
 .bundle
-.env
 coverage
 pkg
-*.sqlite3
-.claude
+*.sqlite3*
+.claude/*.local.*
+.claude/skills/**/*.local.*
+
+.claude/worktrees
+docs

@@ -4,6 +4,7 @@ source "https://rubygems.org"
 
 ruby file: "mise.toml"
 
+gem "csv"
 gem "irb"
 gem "logger"
 gem "money"
@@ -29,7 +30,9 @@ group :test do
   gem "minitest"
   gem "minitest-around"
   gem "minitest-focus"
+  gem "minitest-mock"
   gem "rack-test"
   gem "vcr"
+  gem "skooma"
   gem "webmock"
 end

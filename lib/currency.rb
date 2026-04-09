@@ -1,66 +1,125 @@
 # frozen_string_literal: true
 
-require "db"
+require "money/currency"
+require "peg"
+require "rate"
 
-class Currency < Sequel::Model
+# Virtual model backed by a query over the rates table. Currencies appear as
+# both quote and base, so we UNION and re-group to get one row per currency
+# with materialized start_date and end_date for efficient filtering.
+class Currency < Sequel::Model(
+  Rate.select(Sequel[:quote].as(:iso_code))
+    .select_append { min(date).as(start_date) }
+    .select_append { max(date).as(end_date) }
+    .group(:quote)
+    .union(
+      Rate.select(Sequel[:base].as(:iso_code))
+        .select_append { min(date).as(start_date) }
+        .select_append { max(date).as(end_date) }
+        .group(:base),
+      all: true,
+    )
+    .from_self
+    .select(:iso_code)
+    .select_append { min(start_date).as(start_date) }
+    .select_append { max(end_date).as(end_date) }
+    .group(:iso_code)
+    .order(:iso_code),
+)
+  unrestrict_primary_key
+
   dataset_module do
-    def latest(date = Date.today)
-      date = Date.today if date > Date.today
-      where(date: nearest_date_with_rates(date))
+    def active
+      cutoff = (Date.today - 30).to_s
+      where { end_date >= cutoff }
     end
 
-    def between(interval)
-      return where(false) if interval.begin > Date.today
+    def with_providers(keys)
+      rates = Rate.where(provider: keys)
+      codes = rates.select(Sequel[:quote].as(:iso_code))
+        .union(rates.select(Sequel[:base].as(:iso_code)))
+        .from_self.select(:iso_code).distinct
+      where(iso_code: codes)
+    end
+  end
 
-      where(Sequel.expr(:date) >= Sequel.function(
-        :coalesce,
-        nearest_date_with_rates(interval.begin),
-        interval.begin,
-      ))
-        .where(Sequel.expr(:date) <= interval.end)
-        .order(Sequel.asc(:date), Sequel.asc(:iso_code))
+  class << self
+    def all
+      merge_pegged(super)
     end
 
-    def only(*iso_codes)
-      where(iso_code: iso_codes)
+    def active
+      cutoff = (Date.today - 30).to_s
+      merge_pegged(dataset.active.all).select { |c| c.end_date.to_s >= cutoff }
     end
 
-    def sample(precision)
-      sampler = case precision.to_s
-      when "day"
-        Sequel.function(:strftime, "%Y-%m-%d", :date)
-      when "week"
-        # SQLite's strftime with '%W' gives week number (0-53)
-        # We'll use this to group by week
-        Sequel.function(
-          :date,
-          Sequel.function(
-            :strftime,
-            "%Y-%m-%d",
-            Sequel.function(:strftime, "%Y-01-01", :date),
-            Sequel.lit("'+' || (CAST(strftime('%W', date) AS INTEGER) * 7) || ' days'"),
-          ),
-        )
-      when "month"
-        Sequel.function(:strftime, "%Y-%m-01", :date)
-      when "year"
-        Sequel.function(:strftime, "%Y-01-01", :date)
+    def map(&block)
+      all.map(&block)
+    end
+
+    def find(code)
+      code = code.upcase
+      peg = Peg.find(code)
+      if peg
+        anchor = where(iso_code: peg.base).first
+        return unless anchor
+
+        new_pegged(peg, anchor)
       else
-        raise ArgumentError, "Invalid precision: #{precision}. Must be one of: week, month, year, day"
+        where(iso_code: code).first
+      end
+    end
+
+    private
+
+    def merge_pegged(db_currencies)
+      anchors = db_currencies.to_h { |c| [c.iso_code, c] }
+
+      pegged = Peg.all.filter_map do |peg|
+        anchor = anchors[peg.base]
+        next unless anchor
+
+        new_pegged(peg, anchor)
       end
 
-      select(:iso_code)
-        .select_append { avg(rate).as(rate) }
-        .select_append(sampler.as(:date))
-        .group(:iso_code, sampler)
-        .order(:date)
+      (db_currencies + pegged).sort_by(&:iso_code)
     end
 
-    def nearest_date_with_rates(date)
-      select(:date)
-        .where(Sequel[:date] <= date)
-        .order(Sequel.desc(:date))
-        .limit(1)
+    def new_pegged(peg, anchor)
+      start = [peg.since, Date.parse(anchor.start_date.to_s)].compact.max
+      c = new(iso_code: peg.quote, start_date: start, end_date: anchor.end_date)
+      c.instance_variable_set(:@peg, peg)
+      c
+    end
+  end
+
+  attr_reader :peg
+
+  def money_currency
+    @money_currency ||= Money::Currency.find(iso_code)
+  end
+
+  def to_h
+    {
+      iso_code: iso_code,
+      iso_numeric: money_currency&.iso_numeric,
+      name: money_currency&.name || iso_code,
+      symbol: money_currency&.symbol,
+      start_date: start_date.to_s,
+      end_date: end_date.to_s,
+    }
+  end
+
+  def providers
+    Rate.where(quote: iso_code).or(base: iso_code)
+      .select(:provider).distinct.order(:provider).map(:provider)
+  end
+
+  def to_h_with_providers
+    if peg
+      to_h.merge(peg: { base: peg.base, rate: peg.rate, authority: peg.authority })
+    else
+      to_h.merge(providers: providers)
     end
   end
 end

@@ -4,108 +4,130 @@ require_relative "helper"
 require "currency"
 
 describe Currency do
-  describe ".latest" do
-    it "returns latest available rates on given date" do
-      date = Date.parse("2010-01-04")
-      data = Currency.latest(date)
-
-      _(data.to_a.sample.date).must_equal(date)
-
-      date = Date.parse("2010-01-01")
-      data = Currency.latest(date)
-
-      _(data.to_a.sample.date).must_equal(Date.parse("2009-12-31"))
-    end
-
-    it "returns nothing if date predates dataset" do
-      _(Currency.latest(Date.parse("1901-01-01"))).must_be_empty
-    end
-
-    it "returns latest available rates for future dates" do
-      future_date = Date.today + 1
-      data = Currency.latest(future_date)
-
-      _(data).wont_be_empty
-      _(data.to_a.sample.date).must_equal(Currency.latest.to_a.sample.date)
-    end
+  before do
+    Rate.dataset.delete
+    Rate.multi_insert([
+      { provider: "ECB", date: Date.today, base: "EUR", quote: "USD", rate: 1.1 },
+      { provider: "ECB", date: Date.today, base: "EUR", quote: "GBP", rate: 0.85 },
+      { provider: "BOC", date: Date.today, base: "CAD", quote: "USD", rate: 0.74 },
+      { provider: "ECB", date: Date.today - 365, base: "EUR", quote: "SEK", rate: 11.0 },
+    ])
   end
 
-  describe ".between" do
-    it "returns rates between given working dates" do
-      start_date = Date.parse("2010-01-04")
-      end_date = Date.parse("2010-01-29")
-      dates = Currency.between(start_date..end_date).map(:date).sort.uniq
+  it "lists all currencies" do
+    codes = Currency.all.map(&:iso_code).sort
 
-      _(dates.first).must_equal(start_date)
-      _(dates.last).must_equal(end_date)
-    end
-
-    it "starts on preceding business day if start date is a holiday" do
-      start_date = Date.parse("2024-11-03")
-      end_date = Date.parse("2024-11-04")
-      dates = Currency.between(start_date..end_date).map(:date).uniq
-
-      _(dates).must_include(Date.parse("2024-11-01"))
-    end
-
-    it "returns nothing if end date predates dataset" do
-      interval = (Date.parse("1901-01-01")..Date.parse("1901-01-31"))
-
-      _(Currency.between(interval)).must_be_empty
-    end
-
-    it "allows start date to predate dataset" do
-      start_date = Date.parse("1901-01-01")
-      end_date = Date.parse("2024-01-01")
-      dates = Currency.between(start_date..end_date).map(:date)
-
-      _(dates).wont_be_empty
-    end
-
-    it "returns nothing when start date is in the future" do
-      start_date = Date.today + 1
-      end_date = start_date + 1
-      dates = Currency.between(start_date..end_date).map(:date)
-
-      _(dates).must_be_empty
-    end
+    _(codes).must_include("USD")
+    _(codes).must_include("EUR")
+    _(codes).must_include("CAD")
   end
 
-  describe ".only" do
-    it "filters symbols" do
-      iso_codes = ["CAD", "USD"]
-      data = Currency.latest.only(*iso_codes).all
+  it "merges date ranges across quote and base" do
+    usd = Currency.find("USD")
 
-      _(data.map(&:iso_code).sort).must_equal(iso_codes)
-    end
-
-    it "returns nothing if no matches" do
-      _(Currency.only("FOO").all).must_be_empty
-    end
+    _(usd).wont_be_nil
+    _(usd.start_date.to_s).must_equal(Date.today.to_s)
+    _(usd.end_date.to_s).must_equal(Date.today.to_s)
   end
 
-  describe ".between with sampling" do
-    let(:day) { Date.parse("2010-01-01") }
+  it "includes base currencies" do
+    eur = Currency.find("EUR")
 
-    it "returns everything up to a year" do
-      interval = day..day + 365
-      dates = Currency.between(interval)
+    _(eur).wont_be_nil
+  end
 
-      _(dates.map(:date).uniq.count).must_be(:>, 52)
-    end
+  it "filters active currencies" do
+    active_codes = Currency.active.map(&:iso_code)
 
-    it "can sample weekly" do
-      interval = day..day + 366
-      dates = Currency.between(interval).sample("week")
+    _(active_codes).must_include("USD")
+    _(active_codes).wont_include("SEK")
+  end
 
-      _(dates.map(:date).uniq.count).must_be(:<, 54)
-    end
+  it "returns nil for unknown currency" do
+    _(Currency.find("XYZ")).must_be_nil
+  end
 
-    it "sorts by date when sampling" do
-      interval = day..day + 366
-      dates = Currency.between(interval).sample("week").map(:date)
+  it "formats to hash" do
+    usd = Currency.find("USD")
 
-      _(dates).must_equal(dates.sort)
-    end
+    _(usd.to_h[:name]).must_equal("United States Dollar")
+    _(usd.to_h[:symbol]).must_equal("$")
+    _(usd.to_h[:iso_numeric]).must_equal("840")
+  end
+
+  it "includes providers" do
+    usd = Currency.find("USD")
+
+    _(usd.providers).must_include("ECB")
+    _(usd.providers).must_include("BOC")
+  end
+
+  it "is case insensitive" do
+    _(Currency.find("usd")).wont_be_nil
+  end
+
+  it "filters by providers" do
+    codes = Currency.with_providers(["ECB"]).map(&:iso_code)
+
+    _(codes).must_include("USD")
+    _(codes).must_include("EUR")
+    _(codes).wont_include("CAD")
+  end
+
+  it "excludes pegged currencies when filtering by providers" do
+    codes = Currency.with_providers(["ECB"]).map(&:iso_code)
+
+    _(codes).wont_include("BMD")
+  end
+
+  it "includes pegged currencies in the list" do
+    codes = Currency.all.map(&:iso_code)
+
+    _(codes).must_include("BMD")
+    _(codes).must_include("FKP")
+  end
+
+  it "derives pegged currency date range from anchor" do
+    bmd = Currency.find("BMD")
+
+    _(bmd).wont_be_nil
+    usd = Currency.find("USD")
+
+    _(bmd.end_date.to_s).must_equal(usd.end_date.to_s)
+  end
+
+  it "uses later of peg since and anchor start_date" do
+    bmd = Currency.find("BMD")
+    usd = Currency.find("USD")
+
+    _(bmd.start_date.to_s).must_be(:>=, usd.start_date.to_s)
+  end
+
+  it "formats pegged currency to hash" do
+    bmd = Currency.find("BMD")
+
+    _(bmd.to_h[:iso_code]).must_equal("BMD")
+    _(bmd.to_h[:name]).must_equal("Bermudian Dollar")
+    _(bmd.to_h[:start_date]).wont_be_nil
+    _(bmd.to_h[:end_date]).wont_be_nil
+  end
+
+  it "includes peg metadata in detail hash" do
+    bmd = Currency.find("BMD")
+    h = bmd.to_h_with_providers
+
+    _(h[:peg]).wont_be_nil
+    _(h[:peg][:base]).must_equal("USD")
+    _(h[:peg][:rate]).must_equal(1.0)
+    _(h[:peg][:authority]).must_equal("Bermuda Monetary Authority")
+    _(h).wont_include(:providers)
+  end
+
+  it "returns providers for non-pegged currency detail" do
+    usd = Currency.find("USD")
+    h = usd.to_h_with_providers
+
+    _(h[:providers]).must_be_kind_of(Array)
+    _(h).wont_include(:peg)
   end
 end

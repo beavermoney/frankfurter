@@ -1,65 +1,76 @@
 GEM
   remote: https://rubygems.org/
   specs:
-    addressable (2.8.8)
+    addressable (2.8.9)
       public_suffix (>= 2.0.2, < 8.0)
     ast (2.4.3)
-    base64 (0.3.0)
-    bigdecimal (3.3.1)
-    concurrent-ruby (1.3.5)
+    bigdecimal (4.0.1)
+    concurrent-ruby (1.3.6)
     crack (1.0.1)
       bigdecimal
       rexml
+    csv (3.3.5)
     date (3.5.1)
-    erb (6.0.0)
+    drb (2.2.3)
+    erb (6.0.2)
     et-orbi (1.4.0)
       tzinfo
     fugit (1.12.1)
       et-orbi (~> 1.4)
       raabro (~> 1.4)
+    hana (1.3.7)
     hashdiff (1.2.1)
-    i18n (1.14.7)
+    i18n (1.14.8)
       concurrent-ruby (~> 1.0)
-    io-console (0.8.1)
-    irb (1.15.3)
+    io-console (0.8.2)
+    irb (1.17.0)
       pp (>= 0.6.0)
+      prism (>= 1.3.0)
       rdoc (>= 4.0.0)
       reline (>= 0.4.2)
-    json (2.18.0)
+    json (2.19.2)
+    json_skooma (0.2.5)
+      bigdecimal
+      hana (~> 1.3)
+      regexp_parser (~> 2.0)
+      uri-idna (~> 0.2)
+      zeitwerk (~> 2.6)
     kgio (2.11.4)
     language_server-protocol (3.17.0.5)
     lint_roller (1.1.0)
     logger (1.7.0)
-    mini_portile2 (2.8.9)
-    minitest (5.26.2)
-    minitest-around (0.5.0)
-      minitest (~> 5.0)
-    minitest-focus (1.4.0)
-      minitest (>= 4, < 6)
+    minitest (6.0.2)
+      drb (~> 2.0)
+      prism (~> 1.5)
+    minitest-around (0.6.0)
+      minitest (> 5.0, < 7.0)
+    minitest-focus (1.4.1)
+      minitest (> 5.0)
+    minitest-mock (5.27.0)
     money (7.0.2)
       bigdecimal
       i18n (~> 1.9)
-    oj (3.16.13)
+    oj (3.16.16)
       bigdecimal (>= 3.0)
       ostruct (>= 0.2)
     ostruct (0.6.3)
     ox (2.14.23)
       bigdecimal (>= 3.0)
     parallel (1.27.0)
-    parser (3.3.10.0)
+    parser (3.3.10.2)
       ast (~> 2.4.1)
       racc
     pp (0.6.3)
       prettyprint
     prettyprint (0.2.0)
-    prism (1.6.0)
-    psych (5.3.0)
+    prism (1.9.0)
+    psych (5.3.1)
       date
       stringio
-    public_suffix (7.0.0)
+    public_suffix (7.0.5)
     raabro (1.4.0)
     racc (1.8.1)
-    rack (3.2.4)
+    rack (3.2.5)
     rack-cors (3.0.0)
       logger
       rack (>= 3.0.14)
@@ -68,7 +79,7 @@ GEM
     rainbow (3.1.1)
     raindrops (0.20.1)
     rake (13.3.1)
-    rdoc (6.17.0)
+    rdoc (7.2.0)
       erb
       psych (>= 4.0.0)
       tsort
@@ -76,9 +87,9 @@ GEM
     reline (0.6.3)
       io-console (~> 0.5)
     rexml (3.4.4)
-    roda (3.98.0)
+    roda (3.102.0)
       rack
-    rubocop (1.81.7)
+    rubocop (1.86.0)
       json (~> 2.3)
       language_server-protocol (~> 3.17.0.2)
       lint_roller (~> 1.1.0)
@@ -86,13 +97,13 @@ GEM
       parser (>= 3.3.0.2)
       rainbow (>= 2.2.2, < 4.0)
       regexp_parser (>= 2.9.3, < 3.0)
-      rubocop-ast (>= 1.47.1, < 2.0)
+      rubocop-ast (>= 1.49.0, < 2.0)
       ruby-progressbar (~> 1.7)
       unicode-display_width (>= 2.4.0, < 4.0)
-    rubocop-ast (1.48.0)
+    rubocop-ast (1.49.1)
       parser (>= 3.3.7.2)
-      prism (~> 1.4)
-    rubocop-minitest (0.38.2)
+      prism (~> 1.7)
+    rubocop-minitest (0.39.1)
       lint_roller (~> 1.1)
       rubocop (>= 1.75.0, < 2.0)
       rubocop-ast (>= 1.38.0, < 2.0)
@@ -111,36 +122,38 @@ GEM
     ruby-progressbar (1.13.0)
     rufus-scheduler (3.9.2)
       fugit (~> 1.1, >= 1.11.1)
-    sequel (5.99.0)
+    sequel (5.102.0)
       bigdecimal
-    sqlite3 (2.8.1)
-      mini_portile2 (~> 2.8.0)
-    sqlite3 (2.8.1-aarch64-linux-gnu)
-    sqlite3 (2.8.1-aarch64-linux-musl)
-    sqlite3 (2.8.1-arm-linux-gnu)
-    sqlite3 (2.8.1-arm-linux-musl)
-    sqlite3 (2.8.1-arm64-darwin)
-    sqlite3 (2.8.1-x86-linux-gnu)
-    sqlite3 (2.8.1-x86-linux-musl)
-    sqlite3 (2.8.1-x86_64-darwin)
-    sqlite3 (2.8.1-x86_64-linux-gnu)
-    sqlite3 (2.8.1-x86_64-linux-musl)
-    stringio (3.1.9)
+    skooma (0.3.7)
+      json_skooma (~> 0.2.5)
+      zeitwerk (~> 2.6)
+    sqlite3 (2.9.2-aarch64-linux-gnu)
+    sqlite3 (2.9.2-aarch64-linux-musl)
+    sqlite3 (2.9.2-arm-linux-gnu)
+    sqlite3 (2.9.2-arm-linux-musl)
+    sqlite3 (2.9.2-arm64-darwin)
+    sqlite3 (2.9.2-x86-linux-gnu)
+    sqlite3 (2.9.2-x86-linux-musl)
+    sqlite3 (2.9.2-x86_64-darwin)
+    sqlite3 (2.9.2-x86_64-linux-gnu)
+    sqlite3 (2.9.2-x86_64-linux-musl)
+    stringio (3.2.0)
     tsort (0.2.0)
     tzinfo (2.0.6)
       concurrent-ruby (~> 1.0)
     unicode-display_width (3.2.0)
       unicode-emoji (~> 4.1)
-    unicode-emoji (4.1.0)
+    unicode-emoji (4.2.0)
     unicorn (6.1.0)
       kgio (~> 2.6)
       raindrops (~> 0.7)
-    vcr (6.3.1)
-      base64
-    webmock (3.26.1)
+    uri-idna (0.3.1)
+    vcr (6.4.0)
+    webmock (3.26.2)
       addressable (>= 2.8.0)
       crack (>= 0.3.2)
       hashdiff (>= 0.4.0, < 2.0.0)
+    zeitwerk (2.7.5)
 
 PLATFORMS
   aarch64-linux-gnu
@@ -148,7 +161,6 @@ PLATFORMS
   arm-linux-gnu
   arm-linux-musl
   arm64-darwin
-  ruby
   x86-linux-gnu
   x86-linux-musl
   x86_64-darwin
@@ -156,11 +168,13 @@ PLATFORMS
   x86_64-linux-musl
 
 DEPENDENCIES
+  csv
   irb
   logger
   minitest
   minitest-around
   minitest-focus
+  minitest-mock
   money
   oj
   ox
@@ -175,13 +189,14 @@ DEPENDENCIES
   rubocop-shopify
   rufus-scheduler
   sequel
+  skooma
   sqlite3
   unicorn
   vcr
   webmock
 
 RUBY VERSION
-  ruby 3.4.8
+  ruby 3.4.9
 
 BUNDLED WITH
-  4.0.5
+  4.0.3

@@ -1,5 +1,8 @@
 # frozen_string_literal: true
 
+desc "Migrate and seed the database"
+task "db:setup" => ["db:migrate", "db:seed"]
+
 namespace :db do
   desc "Run database migrations"
   task :migrate do
@@ -14,14 +17,9 @@ namespace :db do
     Sequel::IntegerMigrator.new(db, dir, opts).run
   end
 
-  desc "Run database migrations and seed data"
-  task prepare: ["db:migrate", "rates:all"]
-
-  namespace :test do
-    desc "Run database migrations and seed with saved data"
-    task :prepare do
-      Rake::Task["db:migrate"].invoke
-      Rake::Task["rates:seed_with_saved_data"].invoke
-    end
+  desc "Seed database from saved data"
+  task :seed do
+    require "provider"
+    Provider.seed
   end
 end
