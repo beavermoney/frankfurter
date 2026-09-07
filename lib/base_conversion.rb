@@ -10,20 +10,39 @@ class BaseConversion
 
   def convert
     rates.group_by { |r| r[:provider] }.flat_map do |provider, group|
-      convert_group(group).map { |r| r.merge(provider:) }
+      converted = convert_group(group).map { |r| r.merge(provider:) }
+      reconcile(converted)
     end
   end
 
   private
 
+  # A provider can reach the same quote by more than one bridge during a pivot-currency transition (e.g. Banque du Liban
+  # quoting against both LTL and EUR around Lithuania's 2015 euro adoption). Collapse such duplicates into one averaged
+  # rate per date and quote rather than failing the query: a live 5xx is never the right answer to a provider quirk, and
+  # cross-provider consensus already guards against genuine outliers downstream.
+  def reconcile(rows)
+    rows.group_by { |r| [r[:date], r[:quote]] }.map do |_, group|
+      next group.first if group.size == 1
+
+      mean = group.sum { |r| r[:rate] } / group.size
+      group.first.merge(rate: mean)
+    end
+  end
+
   def convert_group(group)
+    # Index rows by [base, quote] once so cross_convert resolves bridges in O(1) instead of rescanning the group per
+    # row; keep the first occurrence to match Array#find semantics.
+    index = {}
+    group.each { |r| index[[r[:base], r[:quote]]] ||= r }
+
     group.filter_map do |rate|
       if rate[:base] == base
         rate.except(:provider)
       elsif rate[:quote] == base
         invert(rate)
       else
-        cross_convert(rate, group)
+        cross_convert(rate, index)
       end
     end
   end
@@ -32,18 +51,18 @@ class BaseConversion
     { date: rate[:date], base:, quote: rate[:base], rate: 1.0 / rate[:rate] }
   end
 
-  def cross_convert(rate, group)
-    bridge = group.find { |r| r[:base] == base && r[:quote] == rate[:quote] }
+  def cross_convert(rate, index)
+    bridge = index[[base, rate[:quote]]]
     if bridge
       return { date: rate[:date], base:, quote: rate[:base], rate: bridge[:rate] / rate[:rate] }
     end
 
-    bridge = group.find { |r| r[:base] == base && r[:quote] == rate[:base] }
+    bridge = index[[base, rate[:base]]]
     if bridge
       return { date: rate[:date], base:, quote: rate[:quote], rate: rate[:rate] * bridge[:rate] }
     end
 
-    bridge = group.find { |r| r[:base] == rate[:base] && r[:quote] == base }
+    bridge = index[[rate[:base], base]]
     if bridge
       return { date: rate[:date], base:, quote: rate[:quote], rate: rate[:rate] / bridge[:rate] }
     end

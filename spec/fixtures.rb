@@ -1,9 +1,9 @@
 # frozen_string_literal: true
 
+require "bucket"
 require "rate"
 
-# Generates realistic test data for ECB and BOC providers.
-# All dates are relative to today so tests never go stale.
+# Generates realistic test data for ECB and BOC providers. All dates are relative to today so tests never go stale.
 module Fixtures
   BASE_RATES = {
     "ECB" => {
@@ -19,11 +19,18 @@ module Fixtures
         "NOK" => 11.5,
         "PLN" => 4.3,
         "CZK" => 25.1,
+        "PHP" => 81.0193,
       },
     },
     "BOC" => {
       base: "CAD",
       quotes: { "USD" => 0.74, "EUR" => 0.68, "GBP" => 0.58, "JPY" => 109.0 },
+    },
+    "BOJ" => {
+      mixed: [
+        { base: "EUR", quote: "USD", rate: 1.08 },
+        { base: "USD", quote: "JPY", rate: 155.0 },
+      ],
     },
   }.freeze
 
@@ -33,9 +40,12 @@ module Fixtures
   class << self
     def seed!
       Rate.dataset.delete
+      Sequel::Model.db[:blended_rates].delete
       generate_rates.each_slice(1000) do |batch|
         Rate.dataset.multi_insert(batch)
       end
+      rebuild_rollups!
+      rebuild_currencies!
     end
 
     # The most recent business day in the fixture (useful for tests)
@@ -61,7 +71,65 @@ module Fixtures
       date
     end
 
+    # A Monday in the fixture: the first publication day after a weekend gap (mirrors the production "first publish
+    # after a holiday" scenario).
+    def gap_boundary_monday(days_ago = 60)
+      business_days.find { |d| d.monday? && d <= Date.today - days_ago }
+    end
+
     private
+
+    def rebuild_rollups!
+      db = Sequel::Model.db
+
+      db[:weekly_rates].delete
+      week_bucket = Bucket.week
+      db[:weekly_rates].insert(
+        [:bucket_date, :provider, :base, :quote, :rate],
+        db[:rates].select(week_bucket, :provider, :base, :quote, Sequel.function(:avg, :rate))
+          .group(:provider, :base, :quote, week_bucket),
+      )
+
+      db[:monthly_rates].delete
+      month_bucket = Bucket.month
+      db[:monthly_rates].insert(
+        [:bucket_date, :provider, :base, :quote, :rate],
+        db[:rates].select(month_bucket, :provider, :base, :quote, Sequel.function(:avg, :rate))
+          .group(:provider, :base, :quote, month_bucket),
+      )
+    end
+
+    def rebuild_currencies!
+      db = Sequel::Model.db
+
+      db[:currencies].delete
+      db.run(<<~SQL)
+        INSERT INTO currencies (iso_code, start_date, end_date)
+        SELECT iso_code, MIN(start_date), MAX(end_date)
+        FROM (
+          SELECT quote AS iso_code, MIN(date) AS start_date, MAX(date) AS end_date
+          FROM rates GROUP BY quote
+          UNION ALL
+          SELECT base AS iso_code, MIN(date) AS start_date, MAX(date) AS end_date
+          FROM rates GROUP BY base
+        )
+        GROUP BY iso_code
+        ORDER BY iso_code
+      SQL
+
+      db[:currency_coverages].delete
+      db.run(<<~SQL)
+        INSERT INTO currency_coverages (provider_key, iso_code, start_date, end_date)
+        SELECT provider, iso_code, MIN(date), MAX(date)
+        FROM (
+          SELECT provider, quote AS iso_code, date FROM rates
+          UNION ALL
+          SELECT provider, base AS iso_code, date FROM rates
+        )
+        GROUP BY provider, iso_code
+        ORDER BY provider, iso_code
+      SQL
+    end
 
     def generate_rates
       days = business_days
@@ -69,9 +137,16 @@ module Fixtures
 
       BASE_RATES.each do |provider, config|
         days.each do |date|
-          config[:quotes].each do |quote, rate|
-            jitter = 1.0 + (date.jd % 100 - 50) * 0.001 # deterministic jitter from date
-            records << { provider:, date:, base: config[:base], quote:, rate: (rate * jitter).round(4) }
+          jitter = 1.0 + (((date.jd % 100) - 50) * 0.001) # deterministic jitter from date
+          if config[:mixed]
+            config[:mixed].each do |pair|
+              records << { provider:, date:, base: pair[:base], quote: pair[:quote],
+                           rate: (pair[:rate] * jitter).round(4), }
+            end
+          else
+            config[:quotes].each do |quote, rate|
+              records << { provider:, date:, base: config[:base], quote:, rate: (rate * jitter).round(4) }
+            end
           end
         end
       end

@@ -2,14 +2,18 @@
 
 desc "Show outliers rates for last 365 days"
 task "consensus:recent" do
+  require "rate"
   require "blender"
+  require "log"
 
   scan_dates(Date.today - 365, Date.today)
 end
 
 desc "Show outliers rates (all history or a given year)"
 task :consensus, [:year] do |_t, args|
+  require "rate"
   require "blender"
+  require "log"
 
   if args[:year]
     year = Integer(args[:year])
@@ -36,7 +40,7 @@ def scan_dates(from, to)
   end
 
   counts.sort_by(&:last).reverse_each do |combo, count|
-    Log.info(format("%-25s %d", combo, count))
+    Log.info(format("%<combo>-25s %<count>d", combo:, count:))
   end
 
   Log.info("Total: #{total} outliers across #{dates.size} dates")

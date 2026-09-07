@@ -15,6 +15,35 @@ describe App do
 
     _(last_response).must_be(:ok?)
     _(headers["Cache-Control"]).must_equal("public, max-age=86400")
+    json = Oj.load(last_response.body)
+
+    _(json["name"]).must_equal("Frankfurter")
+    _(json["versions"]["v1"]["openapi"]).must_equal("/v1/openapi.json")
+    _(json["versions"]["v1"]["status"]).must_equal("frozen")
+    _(json["versions"]["v2"]["openapi"]).must_equal("/v2/openapi.json")
+    _(json["versions"]["v2"]["status"]).must_equal("current")
+  end
+
+  it "serves v1 root" do
+    get "/v1"
+
+    _(last_response).must_be(:ok?)
+    json = Oj.load(last_response.body)
+
+    _(json["version"]).must_equal("v1")
+    _(json["status"]).must_equal("frozen")
+    _(json["openapi"]).must_equal("/v1/openapi.json")
+  end
+
+  it "serves v2 root" do
+    get "/v2"
+
+    _(last_response).must_be(:ok?)
+    json = Oj.load(last_response.body)
+
+    _(json["version"]).must_equal("v2")
+    _(json["status"]).must_equal("current")
+    _(json["openapi"]).must_equal("/v2/openapi.json")
   end
 
   it "serves static files" do
@@ -34,6 +63,46 @@ describe App do
     json = Oj.load(last_response.body)
 
     _(json["message"]).must_equal("not found")
+  end
+
+  # Through the full middleware stack: the RequestTimeout middleware must not swallow a 503 the query generated after
+  # its own (later-starting) deadline expired.
+  it "delivers a v2 deadline 503 through the middleware stack" do
+    slow_query = Object.new
+    def slow_query.range? = true
+    def slow_query.date_relative? = false
+    def slow_query.cache_key = "x"
+
+    def slow_query.each
+      return to_enum(:each) unless block_given?
+
+      raise RequestTimeout::Error, "request exceeded 90s timeout"
+    end
+
+    Versions::V2::RateQuery.stub(:new, slow_query) do
+      get "/v2/rates?from=2024-01-01&to=2024-02-01"
+    end
+
+    _(last_response.status).must_equal(503)
+    _(last_response.headers["cache-control"]).must_equal("no-store")
+    _(Oj.load(last_response.body)["message"]).must_include("timeout")
+  end
+
+  describe "error responses are not cached" do
+    [
+      ["root 404", "/nonexistent", 404],
+      ["v1 404", "/v1/1000-01-01", 404],
+      ["v2 422", "/v2/rates?date=not-a-date", 422],
+      ["v2 404", "/v2/currency/xyz", 404],
+      ["v2 406", "/v2/currencies.csv", 406],
+    ].each do |label, path, status|
+      it "sets Cache-Control: no-store on #{label}" do
+        get path
+
+        _(last_response.status).must_equal(status)
+        _(last_response.headers["cache-control"]).must_equal("no-store")
+      end
+    end
   end
 
   it "routes /v1 to V1 handler" do

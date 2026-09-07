@@ -4,18 +4,27 @@ require "csv"
 require "currency"
 require "oj"
 require "provider"
-require "providers"
+require "request_timeout"
 require "roda"
-require "versions/v2/query"
+require "versions/v2/rate_query"
 
 module Versions
   class V2 < Roda
+    ROOT_PAYLOAD = {
+      version: "v2",
+      status: "current",
+      openapi: "/v2/openapi.json",
+      docs: "https://frankfurter.dev",
+    }.freeze
+
+    DEFAULT_CACHE_CONTROL = "public, max-age=86400, stale-while-revalidate=86400, stale-if-error=86400"
+
     plugin :json,
-      content_type: "application/json; charset=utf-8",
-      serializer: ->(o) { Oj.dump(o, mode: :compat) }
+           content_type: "application/json; charset=utf-8",
+           serializer: ->(o) { Oj.dump(o, mode: :compat) }
 
     plugin :type_routing,
-      types: { csv: "text/csv" }
+           types: { csv: "text/csv" }
 
     plugin :streaming
     plugin :caching
@@ -26,56 +35,69 @@ module Versions
 
     plugin :error_handler do |error|
       status = case error
-      when Query::ValidationError then 422
-      else 500
-      end
+               when RateQuery::ValidationError then 422
+               when RequestTimeout::Error then 503
+               else 500
+               end
       request.halt(status, { status:, message: error.message })
     end
 
     route do |r|
-      response.cache_control(public: true, max_age: 86400)
+      response["cache-control"] = DEFAULT_CACHE_CONTROL
+
+      r.is { ROOT_PAYLOAD }
+      r.root { ROOT_PAYLOAD }
 
       r.on("rates") do
         r.get do
-          query = Query.new(r.params)
+          query = RateQuery.new(r.params)
+          response["cache-control"] = cache_control_for(query)
           r.etag(query.cache_key)
 
           r.csv do
             if query.range?
+              first, rest = eager_split(query)
               response["Content-Type"] = "text/csv"
+              headers = csv_headers(query)
               stream do |out|
-                first = true
-                query.each do |record|
-                  if first
-                    out << CSV.generate_line(record.keys)
-                    first = false
+                out << CSV.generate_line(headers)
+                if first
+                  out << CSV.generate_line(headers.map { |k| csv_value(first[k]) })
+                  rest.each do |record|
+                    out << CSV.generate_line(headers.map { |k| csv_value(record[k]) })
                   end
-                  out << CSV.generate_line(record.values)
                 end
               end
             else
-              to_csv(query.to_a)
+              to_csv(query.to_a, query)
             end
           end
 
           if ndjson?(r)
+            first, rest = eager_split(query)
             response["Vary"] = "Accept"
             response["Content-Type"] = "application/x-ndjson"
             stream do |out|
-              query.each do |record|
-                out << Oj.dump(record, mode: :compat)
+              if first
+                out << Oj.dump(first, mode: :compat)
                 out << "\n"
+                rest.each do |record|
+                  out << Oj.dump(record, mode: :compat)
+                  out << "\n"
+                end
               end
             end
           elsif query.range?
+            first, rest = eager_split(query)
             response["Content-Type"] = "application/json; charset=utf-8"
             stream do |out|
               out << "["
-              first = true
-              query.each do |record|
-                out << "," unless first
-                out << Oj.dump(record, mode: :compat)
-                first = false
+              if first
+                out << Oj.dump(first, mode: :compat)
+                rest.each do |record|
+                  out << ","
+                  out << Oj.dump(record, mode: :compat)
+                end
               end
               out << "]"
             end
@@ -88,7 +110,8 @@ module Versions
       r.on("rate", String, String) do |base_currency, quote_currency|
         r.get do
           params = r.params.merge("base" => base_currency.upcase, "quotes" => quote_currency.upcase)
-          query = Query.new(params)
+          query = RateQuery.new(params)
+          response["cache-control"] = cache_control_for(query)
           result = query.to_a.first || r.halt(404)
 
           result
@@ -106,21 +129,13 @@ module Versions
 
       r.on("currencies") do
         r.get do
-          providers = r.params["providers"]&.upcase&.split(",")
-          currencies = if providers
-            Currency.with_providers(providers).all
-          elsif r.params["scope"] == "all"
-            Currency.all
-          else
-            Currency.active
-          end
-
-          currencies.map(&:to_h)
+          currencies(r.params)
         end
       end
 
       r.is("providers") do
         r.get do
+          response.cache_control(public: true, max_age: 3600)
           providers
         end
       end
@@ -128,38 +143,94 @@ module Versions
 
     private
 
+    # Date-relative queries anchor on Date.today, so their responses go stale at UTC midnight even when no new data
+    # arrives (and no purge fires) — e.g. forward-dated provider rates entering scope (#541). Cap max-age at the
+    # rollover and drop stale-while-revalidate so the first request after midnight revalidates instead of being served
+    # yesterday's snapshot.
+    def cache_control_for(query)
+      return DEFAULT_CACHE_CONTROL unless query.date_relative?
+
+      "public, max-age=#{seconds_to_utc_midnight}, stale-if-error=86400"
+    end
+
+    def seconds_to_utc_midnight
+      now = Time.now.utc
+      (Time.utc(now.year, now.month, now.day) + 86400 - now).ceil
+    end
+
+    # Pull the first record before streaming so deterministic data errors raise in the route block (caught by
+    # error_handler) instead of mid-stream after response headers — including Cache-Control — have been flushed.
+    #
+    # `rest` continues draining the same fiber-backed enumerator via #next; iterating the enumerator with
+    # #each instead would restart it from the beginning and re-emit the
+    # already-consumed first record.
+    def eager_split(query)
+      enum = query.each
+      first = enum.next
+      rest = Enumerator.new do |y|
+        loop { y << enum.next }
+      end
+      [first, rest]
+    rescue StopIteration
+      [nil, [].each]
+    end
+
     def ndjson?(request)
       accept = request.env["HTTP_ACCEPT"] || ""
       accept.include?("application/x-ndjson")
     end
 
-    def to_csv(records)
+    def to_csv(records, query = nil)
       CSV.generate do |csv|
-        csv << records.first.keys unless records.empty?
-        records.each { |r| csv << r.values }
+        return csv.string if records.empty?
+
+        headers = query ? csv_headers(query) : records.first.keys
+        csv << headers
+        records.each { |r| csv << headers.map { |k| csv_value(r[k]) } }
       end
     end
 
-    def providers
-      date_ranges = Rate.group(:provider)
-        .select { [provider, min(date).as(start_date), max(date).as(end_date)] }
-        .to_h { |r| [r[:provider], { start_date: r[:start_date].to_s, end_date: r[:end_date].to_s }] }
-      currencies = Rate.select(:provider, Sequel[:quote].as(:currency)).distinct
-        .union(Rate.select(:provider, Sequel[:base].as(:currency)).distinct)
-        .order(:provider, :currency).all
-        .group_by(&:provider).transform_values { |rows| rows.map { |r| r[:currency] }.uniq.sort }
+    def csv_headers(query)
+      base = [:date, :base, :quote, :rate]
+      query.expand_providers? ? base + [:providers] : base
+    end
 
-      Provider.all.sort_by(&:key).map do |provider|
-        range = date_ranges[provider.key] || {}
+    def csv_value(value)
+      return value unless value.is_a?(Array)
+
+      value.map { |p| p[:excluded] ? "#{p[:key]}:#{p[:rate]}*" : "#{p[:key]}:#{p[:rate]}" }.join("|")
+    end
+
+    def currencies(params)
+      provider_keys = params["providers"]&.upcase&.split(",")
+      records = if provider_keys
+                  Currency.with_providers(provider_keys).all
+                elsif params["scope"] == "all"
+                  Currency.all
+                else
+                  Currency.active
+                end
+
+      records.map(&:to_h)
+    end
+
+    def providers
+      Provider.eager(:currency_coverages).all.sort_by(&:key).filter_map do |provider|
+        next if provider.currency_coverages.empty?
+
         {
           key: provider.key,
           name: provider.name,
-          description: provider.description,
+          country_code: provider.country_code,
+          rate_type: provider.rate_type,
+          pivot_currency: provider.pivot_currency,
           data_url: provider.data_url,
           terms_url: provider.terms_url,
-          start_date: range[:start_date],
-          end_date: range[:end_date],
-          currencies: currencies[provider.key] || [],
+          start_date: provider.start_date,
+          end_date: provider.end_date,
+          publish_cadence: provider.publish_cadence,
+          publishes_missed: provider.publishes_missed,
+          currencies: provider.currency_coverages.map(&:iso_code).sort,
         }
       end
     end

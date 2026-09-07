@@ -87,6 +87,24 @@ describe Blender do
     usd = result.find { |r| r[:quote] == "USD" }
 
     _(usd[:rate]).must_be_close_to(1.083, 0.01)
-    _(blender.outliers).must_include(["D", "USD"])
+  end
+
+  it "exposes contributing providers and marks outliers as excluded" do
+    rates = [
+      { date: date, base: "EUR", quote: "USD", rate: 1.08, provider: "A" },
+      { date: date, base: "EUR", quote: "USD", rate: 1.09, provider: "B" },
+      { date: date, base: "EUR", quote: "USD", rate: 1.08, provider: "C" },
+      { date: date, base: "EUR", quote: "USD", rate: 9.99, provider: "D" },
+    ]
+
+    result = Blender.new(rates, base: "EUR").blend
+    usd = result.find { |r| r[:quote] == "USD" }
+
+    _(usd[:providers]).must_equal([
+      { key: "A", date: date, rate: 1.08 },
+      { key: "B", date: date, rate: 1.09 },
+      { key: "C", date: date, rate: 1.08 },
+      { key: "D", date: date, rate: 9.99, excluded: true },
+    ])
   end
 end

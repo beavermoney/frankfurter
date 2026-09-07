@@ -1,10 +1,28 @@
-FROM ruby:3.4.9-slim
+# --- Build stage: compile gems with the full toolchain ---
+FROM ruby:4.0.6-slim AS builder
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    build-essential \
+    libyaml-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY Gemfile Gemfile.lock mise.toml ./
+
+RUN gem install bundler && \
+    bundle config set --local deployment 'true' && \
+    bundle config set --local without 'development test' && \
+    bundle install
+
+# --- Runtime stage: only what the app needs to run ---
+FROM ruby:4.0.6-slim
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     curl \
-    build-essential \
-    libyaml-dev && \
+    libyaml-0-2 && \
     rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m -u 1000 frankfurter
@@ -12,20 +30,18 @@ RUN useradd -m -u 1000 frankfurter
 RUN mkdir /app && chown frankfurter:frankfurter /app
 WORKDIR /app
 
-COPY --chown=frankfurter:frankfurter Gemfile Gemfile.lock mise.toml ./
-
-RUN gem install bundler && \
-    bundle config set --local deployment 'true' && \
-    bundle config set --local without 'development test' && \
-    bundle install
+# Copy the compiled bundle (gems + bundler config) from the builder
+COPY --from=builder --chown=frankfurter:frankfurter /usr/local/bundle /usr/local/bundle
+COPY --from=builder --chown=frankfurter:frankfurter /app/vendor /app/vendor
 
 COPY --chown=frankfurter:frankfurter . .
 
 ENV APP_ENV=production
+ENV PORT=8080
 
 USER frankfurter
 
-HEALTHCHECK --interval=2s --timeout=4s --start-period=3s --retries=15 \
-    CMD curl -f "http://localhost:8080" || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
+    CMD exec curl -f --max-time 9 "http://localhost:${PORT:-8080}"
 
-CMD ["bundle", "exec", "unicorn", "-c", "./config/unicorn.rb"]
+CMD ["sh", "-c", "bundle exec rake db:setup && exec bundle exec foreman start"]

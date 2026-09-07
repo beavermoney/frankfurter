@@ -4,26 +4,32 @@ source "https://rubygems.org"
 
 ruby file: "mise.toml"
 
+gem "cgi"
 gem "csv"
+gem "foreman"
+gem "http"
 gem "irb"
 gem "logger"
 gem "money"
+gem "nokogiri"
 gem "oj"
 gem "ox"
+gem "pdf-reader"
+gem "puma"
 gem "rack-cors"
 gem "rake"
 gem "roda"
+gem "rubyzip"
 gem "rufus-scheduler"
 gem "sequel"
+gem "spreadsheet"
 gem "sqlite3"
-gem "unicorn"
 
 group :development, :test do
   gem "rubocop-minitest"
   gem "rubocop-performance"
   gem "rubocop-rake"
   gem "rubocop-sequel"
-  gem "rubocop-shopify"
 end
 
 group :test do
@@ -32,7 +38,7 @@ group :test do
   gem "minitest-focus"
   gem "minitest-mock"
   gem "rack-test"
-  gem "vcr"
   gem "skooma"
+  gem "vcr"
   gem "webmock"
 end

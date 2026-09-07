@@ -1,9 +1,6 @@
 .bundle
-coverage
 pkg
+tmp
 *.sqlite3*
-.claude/*.local.*
-.claude/skills/**/*.local.*
-
-.claude/worktrees
 docs
+.claude/worktrees

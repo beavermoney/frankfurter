@@ -24,6 +24,11 @@ describe Versions::V2 do
   let(:year_start) { (Fixtures.latest_date - 365).to_s }
   let(:year_end) { Fixtures.latest_date.to_s }
 
+  def seconds_to_utc_midnight
+    now = Time.now.utc
+    (Time.utc(now.year, now.month, now.day) + 86400 - now).ceil
+  end
+
   it "returns latest rates" do
     get "/rates"
 
@@ -59,6 +64,83 @@ describe Versions::V2 do
     _(dates.length).must_be(:>, 1)
   end
 
+  it "orders range query rows by date when carry-forward surfaces older quotes" do
+    from = Fixtures.business_day(40)
+    to = Fixtures.business_day(36)
+    Rate.where(provider: "ECB", quote: "USD", date: from..to).delete
+
+    get "/rates?providers=ecb&quotes=USD,GBP&from=#{from}&to=#{to}"
+
+    _(last_response).must_be(:ok?)
+    dates = json.map { |r| r["date"] }
+    usd_row = json.find { |r| r["quote"] == "USD" }
+
+    _(usd_row).wont_be_nil
+    _(usd_row["date"]).must_be(:<, from.to_s)
+    _(dates).must_equal(dates.sort)
+  end
+
+  it "orders weekly rollup rows by date" do
+    get "/rates?from=#{year_start}&to=#{year_end}&group=week"
+
+    _(last_response).must_be(:ok?)
+    dates = json.map { |r| r["date"] }
+
+    _(dates).must_equal(dates.sort)
+  end
+
+  it "does not duplicate the first row of a range query" do
+    from = Fixtures.business_day(60).to_s
+    to = Fixtures.business_day(56).to_s
+    get "/rates?base=EUR&quotes=USD&providers=ecb&from=#{from}&to=#{to}"
+
+    _(last_response).must_be(:ok?)
+    pairs = json.map { |r| [r["date"], r["base"], r["quote"]] }
+
+    _(pairs).must_equal(pairs.uniq)
+  end
+
+  it "does not duplicate the start date when the range opens on a gap boundary" do
+    monday = Fixtures.gap_boundary_monday
+    to = (monday + 2).to_s
+    get "/rates?base=EUR&quotes=USD&providers=ecb&from=#{monday}&to=#{to}"
+
+    _(last_response).must_be(:ok?)
+    starts = json.select { |r| r["date"] == monday.to_s && r["quote"] == "USD" }
+
+    _(starts.length).must_equal(1)
+  end
+
+  it "does not duplicate the first row of an NDJSON range query" do
+    from = Fixtures.business_day(60).to_s
+    to = Fixtures.business_day(56).to_s
+    get(
+      "/rates?base=EUR&quotes=USD&providers=ecb&from=#{from}&to=#{to}",
+      {},
+      { "HTTP_ACCEPT" => "application/x-ndjson" },
+    )
+
+    _(last_response).must_be(:ok?)
+    _(last_response.content_type).must_include("application/x-ndjson")
+    rows = last_response.body.split("\n").reject(&:empty?).map { |line| Oj.load(line) }
+    pairs = rows.map { |r| [r["date"], r["base"], r["quote"]] }
+
+    _(pairs).must_equal(pairs.uniq)
+  end
+
+  it "does not duplicate the first row of a CSV range query" do
+    from = Fixtures.business_day(60).to_s
+    to = Fixtures.business_day(56).to_s
+    get "/rates.csv?base=EUR&quotes=USD&providers=ecb&from=#{from}&to=#{to}"
+
+    _(last_response).must_be(:ok?)
+    _(last_response.content_type).must_include("text/csv")
+    rows = CSV.parse(last_response.body, headers: true)
+    pairs = rows.map { |r| [r["date"], r["base"], r["quote"]] }
+
+    _(pairs).must_equal(pairs.uniq)
+  end
+
   it "rebases to a different currency" do
     get "/rates?base=USD"
 
@@ -88,6 +170,89 @@ describe Versions::V2 do
     quotes = json.map { |r| r["quote"] }.uniq.sort
 
     _(quotes).must_equal(["GBP", "USD"])
+  end
+
+  it "includes the identity rate for the base" do
+    get "/rates"
+
+    _(last_response).must_be(:ok?)
+    assert_conform_schema(200)
+    identity = json.find { |r| r["quote"] == "EUR" }
+
+    _(identity).wont_be_nil
+    _(identity["base"]).must_equal("EUR")
+    _(identity["rate"]).must_equal(1.0)
+    _(identity["date"]).must_equal(json.map { |r| r["date"] }.max)
+  end
+
+  it "includes the identity rate when base is in quotes" do
+    get "/rates?quotes=EUR,USD"
+
+    _(last_response).must_be(:ok?)
+    quotes = json.map { |r| r["quote"] }.uniq.sort
+
+    _(quotes).must_equal(["EUR", "USD"])
+    _(json.find { |r| r["quote"] == "EUR" }["rate"]).must_equal(1.0)
+  end
+
+  it "includes the identity rate per date in range queries" do
+    from = Fixtures.business_day(60)
+    to = Fixtures.business_day(56)
+    get "/rates?providers=ecb&quotes=EUR,USD&from=#{from}&to=#{to}"
+
+    _(last_response).must_be(:ok?)
+    usd_dates = json.select { |r| r["quote"] == "USD" }.map { |r| r["date"] }
+    eur_rows = json.select { |r| r["quote"] == "EUR" }
+
+    _(eur_rows.map { |r| r["date"] }).must_equal(usd_dates)
+    _(eur_rows.map { |r| r["rate"] }.uniq).must_equal([1.0])
+  end
+
+  it "anchors the identity rate to visible rows, not hidden pivot data" do
+    latest = Fixtures.latest_date
+    Rate.where(quote: "GBP", date: latest).delete
+
+    get "/rates?quotes=EUR,GBP"
+
+    _(last_response).must_be(:ok?)
+    gbp = json.find { |r| r["quote"] == "GBP" }
+    eur = json.find { |r| r["quote"] == "EUR" }
+
+    _(gbp["date"]).must_be(:<, latest.to_s)
+    _(eur["date"]).must_equal(gbp["date"])
+  end
+
+  it "includes the identity rate for a pegged base" do
+    get "/rates?base=BMD"
+
+    _(last_response).must_be(:ok?)
+    identity = json.find { |r| r["quote"] == "BMD" }
+
+    _(identity).wont_be_nil
+    _(identity["base"]).must_equal("BMD")
+    _(identity["rate"]).must_equal(1.0)
+  end
+
+  it "omits providers on the identity rate when expanded" do
+    get "/rates?expand=providers&quotes=EUR,USD"
+
+    _(last_response).must_be(:ok?)
+    eur = json.find { |r| r["quote"] == "EUR" }
+    usd = json.find { |r| r["quote"] == "USD" }
+
+    _(eur).wont_be_nil
+    _(eur).wont_include("providers")
+    _(usd["providers"]).must_be_kind_of(Array)
+  end
+
+  it "returns the identity rate for a same-currency pair" do
+    get "/rate/USD/USD"
+
+    _(last_response).must_be(:ok?)
+    _(json["base"]).must_equal("USD")
+    _(json["quote"]).must_equal("USD")
+    _(json["rate"]).must_equal(1.0)
+    _(json["date"]).wont_be_nil
   end
 
   it "filters by provider" do
@@ -147,11 +312,104 @@ describe Versions::V2 do
     _(last_response.headers["ETag"]).wont_be_nil
   end
 
+  it "lets caches serve stale rates on revalidation and origin errors" do
+    get "/rates?from=#{range_start}&to=#{range_end}"
+
+    cache_control = last_response.headers["Cache-Control"]
+
+    _(cache_control).must_include("public")
+    _(cache_control).must_include("max-age=86400")
+    _(cache_control).must_include("stale-while-revalidate")
+    _(cache_control).must_include("stale-if-error")
+  end
+
+  it "expires date-relative responses at next UTC midnight" do
+    ["/rates", "/rates?from=#{range_start}", "/rates?to=#{range_end}"].each do |path|
+      before = seconds_to_utc_midnight
+      get path
+      after = seconds_to_utc_midnight
+
+      cache_control = last_response.headers["Cache-Control"]
+
+      _(cache_control).must_include("public")
+      _(cache_control).must_include("stale-if-error")
+      _(cache_control).wont_include("stale-while-revalidate")
+      max_age = cache_control[/max-age=(\d+)/, 1].to_i
+
+      _(max_age).must_be(:<=, before)
+      _(max_age).must_be(:>=, after)
+    end
+  end
+
+  it "keeps the fixed max-age for explicit-date queries" do
+    get "/rates?date=#{historical_date}"
+
+    _(last_response.headers["Cache-Control"]).must_include("max-age=86400")
+  end
+
   it "returns 422 for unknown parameters" do
     get "/rates?provider=ecb"
 
     _(last_response.status).must_equal(422)
     _(json["message"]).must_include("unknown parameter")
+  end
+
+  it "returns 422 for expand=providers daily ranges longer than 5 years" do
+    get "/rates?from=2000-01-01&expand=providers"
+
+    _(last_response.status).must_equal(422)
+    assert_conform_schema(422)
+    _(json["message"]).must_include("quotes=")
+    _(json["message"]).must_include("group=week or group=month")
+    _(json["message"]).must_include("split the range")
+  end
+
+  it "serves plain daily ranges longer than 5 years without any quotes filter" do
+    BlendedRate.rebuild
+
+    get "/rates?from=2000-01-01"
+
+    _(last_response).must_be(:ok?)
+    _(json).wont_be_empty
+  end
+
+  it "returns 503 when the deadline expires before streaming starts" do
+    slow_query = Object.new
+    def slow_query.range? = true
+    def slow_query.date_relative? = false
+    def slow_query.cache_key = "x"
+
+    def slow_query.each
+      return to_enum(:each) unless block_given?
+
+      raise RequestTimeout::Error, "request exceeded 90s timeout"
+    end
+
+    Versions::V2::RateQuery.stub(:new, slow_query) do
+      get "/rates?from=#{range_start}&to=#{range_end}"
+    end
+
+    _(last_response.status).must_equal(503)
+    assert_conform_schema(503)
+    _(json["message"]).must_include("timeout")
+  end
+
+  it "routes deterministic errors in range queries through error_handler" do
+    bad_query = Object.new
+    def bad_query.range? = true
+    def bad_query.cache_key = "x"
+
+    def bad_query.each
+      return to_enum(:each) unless block_given?
+
+      raise "boom"
+    end
+
+    Versions::V2::RateQuery.stub(:new, bad_query) do
+      get "/rates?from=#{range_start}&to=#{range_end}"
+    end
+
+    _(last_response.status).must_equal(500)
   end
 
   it "returns rates as CSV" do
@@ -163,6 +421,43 @@ describe Versions::V2 do
 
     _(rows.headers).must_equal(["date", "base", "quote", "rate"])
     _(rows.length).must_be(:>, 1)
+  end
+
+  it "expands providers when requested" do
+    get "/rates?expand=providers&quotes=USD"
+
+    _(last_response).must_be(:ok?)
+    json = Oj.load(last_response.body)
+
+    _(json).wont_be_empty
+    providers = json.first["providers"]
+
+    _(providers).must_be_kind_of(Array)
+    _(providers).wont_be_empty
+    _(providers.first).must_be_kind_of(Hash)
+    _(providers.first.keys.sort).must_equal(["date", "key", "rate"])
+    _(providers.first["key"]).must_be_kind_of(String)
+    _(providers.first["date"]).must_be_kind_of(String)
+    _(providers.first["rate"]).must_be_kind_of(Numeric)
+  end
+
+  it "pipe-delimits providers as KEY:RATE in CSV when expand=providers" do
+    from = (Fixtures.latest_date - 7).to_s
+    to = Fixtures.latest_date.to_s
+    get "/rates.csv?expand=providers&quotes=USD&from=#{from}&to=#{to}"
+
+    _(last_response).must_be(:ok?)
+    rows = CSV.parse(last_response.body, headers: true)
+
+    _(rows.headers).must_equal(["date", "base", "quote", "rate", "providers"])
+    _(rows.first["providers"]).wont_be_nil
+    _(rows.first["providers"]).must_match(/\A[A-Z]+:[\d.]+\*?(\|[A-Z]+:[\d.]+\*?)*\z/)
+  end
+
+  it "rejects unknown expand value" do
+    get "/rates?expand=foo"
+
+    _(last_response.status).must_equal(422)
   end
 
   it "returns 406 for CSV on unsupported endpoints" do
@@ -320,13 +615,37 @@ describe Versions::V2 do
   end
 
   it "iterates over range results" do
-    query = Versions::V2::Query.new("from" => range_start, "to" => range_end)
+    query = Versions::V2::RateQuery.new("from" => range_start, "to" => range_end)
     records = []
     query.each { |r| records << r }
 
     _(records).wont_be_empty
     _(records.first).must_include(:date)
     _(records.first).must_include(:rate)
+  end
+
+  it "returns rates in alphabetical order by quote" do
+    get "/rates"
+
+    _(last_response).must_be(:ok?)
+    quotes = json.map { |r| r["quote"] }
+
+    _(quotes).must_equal(quotes.sort)
+  end
+
+  it "keeps the latest snapshot alphabetical when carry-forward surfaces an older-dated quote" do
+    latest = Fixtures.latest_date
+    Rate.where(quote: "SEK", date: latest).delete
+
+    get "/rates"
+
+    _(last_response).must_be(:ok?)
+    quotes = json.map { |r| r["quote"] }
+    sek_row = json.find { |r| r["quote"] == "SEK" }
+
+    _(sek_row).wont_be_nil
+    _(sek_row["date"]).must_be(:<, latest.to_s)
+    _(quotes).must_equal(quotes.sort)
   end
 
   it "excludes pegged currencies when providers filter is set" do
@@ -360,6 +679,45 @@ describe Versions::V2 do
     _(ecb["start_date"]).wont_be_nil
     _(ecb["end_date"]).wont_be_nil
     _(ecb["currencies"]).must_include("USD")
+  end
+
+  it "returns structured provider metadata" do
+    get "/providers"
+
+    ecb = json.find { |p| p["key"] == "ECB" }
+
+    _(ecb["rate_type"]).must_equal("reference rate")
+    _(ecb["pivot_currency"]).must_equal("EUR")
+    _(ecb["country_code"]).must_equal("EU")
+    _(ecb).wont_include("description")
+  end
+
+  it "includes publishes_missed per provider" do
+    get "/providers"
+
+    ecb = json.find { |p| p["key"] == "ECB" }
+
+    _(ecb).must_include("publishes_missed")
+    _(ecb["publishes_missed"]).must_be_kind_of(Integer)
+    _(ecb["publishes_missed"]).must_be(:>=, 0)
+  end
+
+  it "includes publish_cadence per provider" do
+    get "/providers"
+
+    ecb = json.find { |p| p["key"] == "ECB" }
+
+    _(ecb).must_include("publish_cadence")
+    _(ecb["publish_cadence"]).must_equal("daily")
+  end
+
+  it "excludes providers without rates" do
+    get "/providers"
+
+    keys = json.map { |p| p["key"] }
+    without_rates = (Provider.all.map(&:key) - Rate.distinct.select_map(:provider)).sample
+
+    _(keys).wont_include(without_rates)
   end
 
   it "expands pegged currencies in rates" do
@@ -439,12 +797,13 @@ describe Versions::V2 do
     _(json["rate"]).must_be_close_to(1.0 / 1.79, 0.001)
   end
 
-  it "resolves pegged base with providers filter" do
+  it "excludes pegs when providers filter is set" do
+    # BMD pegs 1:1 to USD; ECB does not publish BMD. Pegs are a source of rate data, so scoping ?providers= to ECB
+    # excludes pegs along with all other unlisted sources.
     get "/rates?base=BMD&providers=ecb"
 
     _(last_response).must_be(:ok?)
-    _(json).wont_be_empty
-    _(json.first["base"]).must_equal("BMD")
+    _(json).must_be_empty
   end
 
   it "includes pegged currencies in currencies list" do
@@ -468,7 +827,13 @@ describe Versions::V2 do
     _(json["peg"]["base"]).must_equal("USD")
     _(json["peg"]["rate"]).must_equal(1.0)
     _(json["peg"]["authority"]).must_equal("Bermuda Monetary Authority")
-    _(json).wont_include("providers")
+  end
+
+  it "always includes providers for pegged currency detail" do
+    get "/currency/bmd"
+
+    _(last_response).must_be(:ok?)
+    _(json["providers"]).must_be_kind_of(Array)
   end
 
   it "returns providers for non-pegged currency detail" do

@@ -1,88 +1,200 @@
 # Frankfurter
 
-Frankfurter is a free and open-source currency data API built with Ruby that tracks reference exchange rates from 20+ institutional sources (central banks, the IMF, the Federal Reserve, etc.).
+Frankfurter is a free and open-source currency data API built with Ruby that tracks reference exchange rates from 50+ institutional sources (central banks, the IMF, the Federal Reserve, etc.).
+
+## Before You Write Code
+
+Several agents work in this repo at once. Assume you are not alone.
+
+**Do your work in a git worktree, not in the primary checkout.** The primary
+checkout is shared ground. Two agents editing it at the same time lose each
+other's work: one stages the other's files, or checks the branch out from under
+them mid-task. This has happened repeatedly.
+
+Check before your first edit. The branch reported at session start is a snapshot
+and goes stale:
+
+```bash
+git rev-parse --abbrev-ref HEAD    # the live branch
+git status --short                 # files you never touched mean someone else is here
+for p in $(pgrep -x claude); do lsof -a -p $p -d cwd -Fn 2>/dev/null | sed -n 's/^n//p'; done | sort | uniq -c
+```
+
+Then take a worktree. Use the native `EnterWorktree` tool if your harness has one,
+otherwise:
+
+```bash
+git fetch origin
+git worktree add .claude/worktrees/<slug> -b <branch> origin/main
+cp -R .zed .claude/worktrees/<slug>/.zed   # gitignored, so a fresh worktree comes up bare
+```
+
+Worktrees live under `.claude/worktrees/` (gitignored), never as siblings of the
+checkout. Branch off `origin/main`, not local `main`, which may be stale or may
+belong to another agent. A stacked local branch is often already upstream as a
+squash merge, so `origin/main` is the right base even when local commits look
+unmerged.
+
+**Exceptions.** Read-only work needs no worktree. Neither does a single edit you
+will commit within the minute, provided `git status` is clean and no other agent
+is live here. Everything else gets a worktree.
 
 ## Architecture
 
-- Roda web framework with Rack middleware
-- SQLite with Sequel ORM (WAL mode)
-- Unicorn
-- Rufus scheduler for background data updates
-- Cloudflare CDN with cache purge on import
+- Roda
+- SQLite with Sequel
+- Puma
+- Rufus scheduler
+- Foreman
+- Cloudflare CDN
 
 ## Project Structure
 
 ```
 lib/
-├── app.rb                    # Main Roda app — mounts v1 and v2
-├── cache.rb                  # Cloudflare cache purge
-├── currency.rb               # Currency virtual model (UNION over rates)
-├── provider.rb               # Provider model (Sequel, static cache)
-├── rate.rb                   # Rate model with query scopes
-├── db.rb                     # Database configuration
-├── providers.rb              # Auto-requires all providers from providers/
-├── providers/
-│   ├── base.rb               # Provider interface: fetch, import, backfill
-│   └── <key>.rb              # One file per provider (auto-discovered)
+├── app.rb                       # Main Roda app — mounts v1 and v2
+├── base_conversion.rb           # Rebases rates from any base to a common base
+├── blend_parity.rb              # Parity harness: replays query shapes through table and live paths
+├── blended_rate.rb              # BlendedRate model: materialized pivot-frame blend, refresh/rebuild
+├── blender.rb                   # Blends multi-provider rates: rebase → consensus → weighted average
+├── bucket.rb                    # Shared SQL bucket expressions for weekly/monthly aggregation
+├── cache.rb                     # Cloudflare cache purge, debounced with a trailing edge
+├── carry_forward.rb             # Carries forward most recent provider rate within a lookback window
+├── consensus.rb                 # Cross-provider outlier detection (MAD-based)
+├── currency.rb                  # Currency model (materialized from rates)
+├── currency_coverage.rb         # CurrencyCoverage model (provider-currency join)
+├── defunct_currency.rb          # Defunct-currency registry: terminal dates for retired/redenominated ISO codes
+├── db.rb                        # Database configuration
+├── currency_patches.rb          # Patches Money::Currency: registers historical codes, fixes mangled names
+├── log.rb                       # Shared logger
+├── monthly_rate.rb              # MonthlyRate model on monthly_rates rollup table
+├── no_store_on_error.rb         # Rack middleware: stops CDNs/caches from holding error responses
+├── peg.rb                       # Currency peg definitions (from db/seeds/pegs/*.json)
+├── peg_anchor.rb                # Peg-aware post-processing: substitutes peg rates, synthesises uncovered pegged quotes
+├── provider.rb                  # Provider model: identity, backfill
+├── provider/
+│   ├── adapters/
+│   │   ├── adapter.rb           # Abstract adapter: fetch interface, chunked iteration
+│   │   └── <key>.rb             # One adapter per provider (auto-discovered)
+│   └── adapters.rb              # Auto-requires all adapters
+├── rate.rb                      # Rate model on rates table
+├── rate_precision.rb            # Ingest-precision policy: strips binary float noise from synthesized rates
+├── rate_scopes.rb               # Shared dataset scopes for rate tables (rates, weekly, monthly)
+├── rate_validation.rb           # Ingest-validation policy: drops invalid rows on ingest, purges stored ones
+├── roundable.rb                 # Currency-aware decimal rounding
+├── weekly_rate.rb               # WeeklyRate model on weekly_rates rollup table
+├── weighted_average.rb          # Recency-weighted averaging with exponential decay
 ├── versions/
-│   ├── v1.rb                 # Legacy API (ECB-only, frozen)
-│   ├── v1/                   # V1 internals (quotes, rounding, currency names)
-│   ├── v2.rb                 # Multi-provider API
+│   ├── v1.rb                    # Legacy API (ECB-only, frozen)
+│   ├── v1/                      # V1 internals (quotes, query, currency names)
+│   ├── v2.rb                    # Multi-provider API
 │   └── v2/
-│       └── query.rb          # V2 query builder (blending, filtering)
+│       └── rate_query.rb        # V2 rate query builder (blending, filtering)
 ├── public/
-│   ├── v1/openapi.json       # V1 OpenAPI spec
-│   └── v2/openapi.json       # V2 OpenAPI spec
+│   ├── favicon.ico              # Served as a static file
+│   ├── robots.txt               # Served as a static file
+│   ├── v1/openapi.json          # V1 OpenAPI spec
+│   └── v2/openapi.json          # V2 OpenAPI spec
 └── tasks/
-    ├── db.rake               # Database migrations and setup
-    └── providers.rake         # Dynamic backfill task for all providers
+    ├── blend.rake               # Rebuild/verify the materialized blend
+    ├── cache.rake               # Manual CDN purge
+    ├── consensus.rake           # Consensus scan across providers
+    ├── db.rake                  # Database migrations and setup
+    ├── default.rake             # Default task (lint + test)
+    ├── providers.rake           # Dynamic backfill task for all providers
+    ├── rollups.rake             # Rebuild weekly/monthly rollup tables
+    ├── rubocop.rake             # Linter task
+    └── test.rake                # Test suite task
 
-spec/                         # Minitest test suite
-db/migrate/                   # Sequel migrations
+spec/                            # Minitest test suite
+db/migrate/                      # Sequel migrations
 db/seeds/
-    └── providers.json        # Provider metadata (key, name, description, urls)
+    ├── currency_patches.json    # Money::Currency patches (historical codes, name fixes)
+    ├── defunct_currencies.json  # Defunct currencies: terminal dates for retired/redenominated ISO codes
+    ├── pegs/                    # One JSON file per peg (e.g. aed.json, bam.json)
+    └── providers/               # One JSON file per provider (e.g. ecb.json, boi.json)
 ```
 
 ## Key Components
 
-### Providers (lib/providers/)
-- `Providers::Base`: Shared interface — `key`, `base`, `fetch`, `import`, `backfill`
-- `key`, `name` are class methods; instance methods delegate
-- `fetch(since: nil, upto: nil)`: fetches rate data from the source API
-- `self.backfill(range:)`: queries DB for last stored date, fetches forward, imports. `range:` enables chunked requests for APIs with result limits.
-- `import`: writes to DB via upsert, filters excluded quotes (precious metals, SDR), purges Cloudflare cache
-- All providers auto-register via `inherited` hook into `Providers.all`
+### Adapters (lib/provider/adapters/)
+- `Provider::Adapters::Adapter`: Abstract base class — `fetch` interface, `fetch_each` for chunked iteration, shared `http` client (http.rb, retries 429s, ensures non-2xx raises `HTTP::StatusError`), sleep no-op in test env
+- `midpoint(buy, sell)`: exact decimal mid for sources that publish buy/sell instead of a reference rate. Use it instead of `(buy + sell) / 2.0`, which leaves float noise in the low digits
+- Adapters are pure data extraction: they know how to talk to an external API and parse its response
+- No identity — adapters have no `key` or `name`. Provider model owns identity.
+- Optional class methods: `def backfill_range = N`, `def api_key = ENV[...] || raise("no API key")`
+- Auto-discovered from `lib/provider/adapters/` via loader
 
 ### Models
-- `Rate`: Sequel model on `rates` table. Scopes: `latest(date)`, `between(interval)`, `only(*quotes)`, `downsample(precision)`
-- `Currency`: Virtual model backed by UNION query over rates. Derives currencies, date ranges from data.
-- `Provider`: Sequel model on `providers` table (seeded from `db/seeds/providers.json`). Static cache.
+- `Rate`: Sequel model on `rates` table. Scopes via `RateScopes`: `latest(date)`, `between(interval)`, `only(*quotes)`, `downsample(precision)`
+- `WeeklyRate`, `MonthlyRate`: Rollup models on `weekly_rates` / `monthly_rates`, share scopes via `RateScopes`
+- `Currency`: Sequel model on `currencies` table. Materialized from rates during backfill. Tracks global date ranges per currency.
+- `CurrencyCoverage`: Join model on `currency_coverages` table. One row per (provider, currency) with per-provider date ranges. Belongs to Provider and Currency.
+- `Provider`: Sequel model on `providers` table. Static config-as-data: seeded from `db/seeds/providers/*.json` on every container start so provider metadata always tracks the image.
+  - `#adapter`: finds adapter by convention (`Provider::Adapters.const_get(key)`)
+  - `#backfill`: incremental backfill — starts from `last_synced` or `coverage_start`, delegates to `adapter.fetch_each`, filters excluded quotes, stamps provider key, inserts to DB, refreshes currency summaries
+    - The insert is `ON CONFLICT DO NOTHING`, not an upsert: a row already stored for `(provider, date, base, quote)` is never rewritten. A fix that changes the *value* of stored rows therefore does nothing on re-backfill, and does it silently, since the rollup, currency-summary and blend refreshes are all gated on a positive insert count. Delete the provider's rows from `rates`, `weekly_rates` and `monthly_rates` first, then backfill from `coverage_start`. Rollups rebuild themselves from the new inserts; `blended_rates` refreshes on insert only and never on delete, so a change that moves pairs across the unique index also needs `rake blend:rebuild`. Verify with `rake blend:parity`, ideally against a baseline taken before the change.
+  - `#start_date`, `#end_date`: derived from currency coverages
+  - `many_to_many :currencies` through `currency_coverages`
+- `Peg`: Value object for currency pegs (from `db/seeds/pegs/*.json`)
+
+### Blending Pipeline
+- `Blender`: orchestrates rebase → consensus → weighted average
+- `BaseConversion`: rebases rates from each provider's native base to a common base via inversion or cross rates
+- `Consensus`: MAD-based outlier detection — flags rates that deviate significantly from the cross-provider median
+- `WeightedAverage`: recency-weighted averaging with exponential decay past a grace period
 
 ### API (lib/app.rb)
 - V1 at `/v1/*` — frozen legacy, ECB-only
 - V2 at `/v2/*` — multi-provider with blended rates
+- Root `/` returns an inline index document (name, versions, docs, source)
 - CORS enabled for all origins
+- `NoStoreOnError` middleware prevents CDNs/caches from holding error responses
 - OpenAPI specs served as static files at `/v1/openapi.json` and `/v2/openapi.json`
 
 ### Scheduler (bin/schedule)
+- Runs as its own process, started by foreman alongside the web server (see `Procfile`)
+- Calls `provider.backfill` directly on Provider model instances
 - Staggers startup backfill for all providers (2s apart)
-- Cron schedules derived from `publish_time` and `publish_days` in the providers table
-- Convention: poll every 30 min for 3 hours starting at `publish_time`
+- Flushes pending debounced cache purges on a 60s tick (trailing edge)
+- Re-blends the trailing two days at UTC midnight so next-day observations pick up fresh decay weights
+- Cron schedule read from `publish_schedule` in the providers table (5-field cron; `null` for historical-only providers)
+- Convention: poll every 30 min across a 3-hour window starting at the publish hour (encoded directly in the cron expression, e.g. `*/30 14-16 * * 1-5` for ECB)
 - Backfill is incremental: fetches only from the last stored date forward
 
 ## Database
 
-SQLite database with `rates` and `providers` tables.
+SQLite database with `rates`, `weekly_rates`, `monthly_rates`, `providers`, `currencies`, and `currency_coverages` tables.
+
+### blended_rates
+- `date`, `quote`, `rate` with PK `(quote, date)`; base is implicitly USD, the blend pivot
+- Materialized blend, sparse: one row per (quote, date) where the contributor set changed, each the canonical anchor-date value
+- Refreshed during backfill over `[min_inserted, max_inserted + 14]`; rebuilt by `rake blend:rebuild` (required whenever blend/consensus/peg/currency-patch code or seeds change)
+- Serves all plain V2 shapes, latest and single-date included (no `providers=`, no `expand=providers`); live path is the fallback while empty
 
 ### rates
 - `date`, `base`, `quote`, `rate`, `provider`
 - Unique index on `(provider, date, base, quote)`
 
+### weekly_rates, monthly_rates
+- Pre-aggregated rollups keyed by `bucket_date` (Monday for weekly, first-of-month for monthly)
+- Rebuilt by `rake rollups:rebuild` and refreshed during backfill
+
 ### providers
-- `key`, `name`, `description`, `data_url`, `terms_url`, `publish_time`, `publish_days`
-- Seeded from `db/seeds/providers.json`
-- `publish_time`: UTC hour when the provider typically publishes new rates
-- `publish_days`: cron-style day range (e.g. "1-5" for Mon-Fri, "0-4" for Sun-Thu)
+- `key`, `name`, `rate_type`, `country_code`, `data_url`, `terms_url`, `publish_schedule`, `publish_cadence`, `coverage_start`, `pivot_currency`
+- Seeded from `db/seeds/providers/*.json`
+- `publish_schedule`: 5-field cron expression (minute hour day-of-month month day-of-week) in UTC, or `null` for historical-only providers. Convention: `*/30 H-H+2 * * D` where H is the publish hour and D is the day-of-week range, giving a 3-hour polling window.
+- `publish_cadence`: one of `daily`, `weekly`, `monthly`, or `null` for historical-only providers. Dispatches `publishes_missed` to the right algorithm (per-fire-day count for daily; ISO-week bucket for weekly; year-month bucket for monthly).
+- `coverage_start`: earliest date for historical data (used as backfill starting point)
+
+### currencies
+- `iso_code` (PK), `start_date`, `end_date`
+- Global date range per currency, materialized during backfill
+
+### currency_coverages
+- `provider_key`, `iso_code`, `start_date`, `end_date`
+- PK `(provider_key, iso_code)`
+- Per-provider date range per currency, materialized during backfill
 
 ## Testing
 
@@ -109,27 +221,55 @@ Separate SQLite databases per environment (`APP_ENV`): test, development, produc
 bundle install                          # Install dependencies
 bundle exec rake db:setup               # Run migrations and seed providers
 bundle exec rake backfill               # Backfill all providers (takes a while)
-bundle exec unicorn                     # Start server on port 8080
+bundle exec puma -C config/puma.rb      # Start web server on port 8080
+bundle exec foreman start               # Start web + scheduler together (mirrors prod)
 ```
 
 Or with Docker:
 ```bash
-docker run -d -p 80:8080 lineofflight/frankfurter
+docker run -d --init -p 80:8080 lineofflight/frankfurter
 ```
+
+### Legacy TLS
+
+BCN's endpoint only supports TLS 1.0, which OpenSSL 3.5+ disables by default. Set `OPENSSL_CONF=config/openssl_legacy.cnf` to enable it. Without this, BCN skips backfill with "legacy TLS required, skipping".
 
 ## Rake Tasks
 
 ```bash
-rake db:setup        # Run migrations and seed providers
-rake db:migrate      # Run database migrations
-rake db:seed         # Seed provider metadata
-rake backfill        # Backfill all providers (threaded, incremental)
-rake backfill[ecb]   # Backfill a single provider
+rake db:setup           # Run migrations and seed providers
+rake db:migrate         # Run database migrations
+rake db:seed            # Seed provider metadata
+rake backfill           # Backfill all providers (threaded, incremental)
+rake backfill[ecb]      # Backfill a single provider
+rake blend:rebuild      # Rebuild the materialized blend from scratch
+rake blend:parity       # Replay query shapes through table and live paths, compare bytes
+rake cache:purge        # Purge the CDN cache manually
+rake rollups:rebuild    # Rebuild weekly and monthly rollups
+rake rollups:rebuild[ecb] # Rebuild rollups for a single provider
 ```
 
 ## Adding a New Provider
 
-See [.claude/skills/add-provider.md](.claude/skills/add-provider.md) for the full checklist and workflow.
+See [.agents/skills/implementing-providers/SKILL.md](.agents/skills/implementing-providers/SKILL.md) for the full checklist and workflow.
+
+## Currency Patches
+
+`db/seeds/currency_patches.json` patches `Money::Currency` at boot via
+`lib/currency_patches.rb`. Two purposes:
+
+- Register historical ISO 4217 codes (pre-euro, pre-redenomination) the gem
+  doesn't include — full entry with `name`, `symbol`, `subunit_to_unit`, `iso_numeric`.
+- Override mangled names on existing entries (e.g. `Cfa` → `CFA`) — partial
+  entry with just `iso_code` and `name`; existing fields are preserved via merge.
+
+When adding a new provider, check whether it serves historical currencies and
+note them in coverage research. To pick up previously-dropped records,
+re-backfill the provider from its `coverage_start`:
+
+```ruby
+Provider["key"].backfill(after: Date.new(YYYY, 1, 1))
+```
 
 ## Development Notes
 
@@ -137,6 +277,37 @@ See [.claude/skills/add-provider.md](.claude/skills/add-provider.md) for the ful
 - Linting: RuboCop with Shopify style guide (120-char line length)
 - Migrations in `db/migrate/`
 - Update `CHANGELOG.md` for changes that directly impact user experience
+
+### Recovering from a shared tree
+
+See [Before You Write Code](#before-you-write-code) for the rule. This is what to
+do once it has already gone wrong.
+
+**You are sharing a working tree.** The tell is `git status` listing files you
+never touched, with mtimes from minutes ago. Do not commit the mixed tree and do
+not bare-stash. Stash only your own paths with
+`git stash push -m "wip" -- <your files>`, confirm the other agent's files
+survived, then take a fresh worktree and pop there.
+
+**The checkout was moved onto someone else's branch.** Save your work with
+`git diff > /tmp/mine.patch`, `git checkout --` your files to hand the tree back
+clean, then worktree off `origin/main` and `git apply --3way`. Expect a
+`CHANGELOG.md` conflict, since their entry is on their branch and not on main.
+
+**A red test suite may not be yours.** Concurrent `rake spec` runs raise
+`SQLite3::BusyException` and produce phantom failures. Rerun once, alone, before
+believing a failure.
+
+**Removing a worktree.** Do it from outside the worktree. Your shell's working
+directory is pinned to it, so deleting the one you are standing in strands the
+session. `ExitWorktree` refuses to remove a worktree entered by `path`; use
+`action: "keep"` and then `git worktree remove`. After a squash merge
+`git branch -d` refuses. Diff the branch against main to confirm the content
+landed, then use `-D`.
+
+## Handling Data
+
+Relay what providers publish. Don't editorialize.
 
 ## API Endpoints
 

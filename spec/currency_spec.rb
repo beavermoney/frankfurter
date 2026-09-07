@@ -12,6 +12,35 @@ describe Currency do
       { provider: "BOC", date: Date.today, base: "CAD", quote: "USD", rate: 0.74 },
       { provider: "ECB", date: Date.today - 365, base: "EUR", quote: "SEK", rate: 11.0 },
     ])
+
+    db = Sequel::Model.db
+    db[:currencies].delete
+    db.run(<<~SQL)
+      INSERT OR REPLACE INTO currencies (iso_code, start_date, end_date)
+      SELECT iso_code, MIN(start_date), MAX(end_date)
+      FROM (
+        SELECT quote AS iso_code, MIN(date) AS start_date, MAX(date) AS end_date
+        FROM rates GROUP BY quote
+        UNION ALL
+        SELECT base AS iso_code, MIN(date) AS start_date, MAX(date) AS end_date
+        FROM rates GROUP BY base
+      )
+      GROUP BY iso_code
+      ORDER BY iso_code
+    SQL
+
+    db[:currency_coverages].delete
+    db.run(<<~SQL)
+      INSERT OR REPLACE INTO currency_coverages (provider_key, iso_code, start_date, end_date)
+      SELECT provider, iso_code, MIN(date), MAX(date)
+      FROM (
+        SELECT provider, quote AS iso_code, date FROM rates
+        UNION ALL
+        SELECT provider, base AS iso_code, date FROM rates
+      )
+      GROUP BY provider, iso_code
+      ORDER BY provider, iso_code
+    SQL
   end
 
   it "lists all currencies" do
@@ -103,6 +132,72 @@ describe Currency do
     _(bmd.start_date.to_s).must_be(:>=, usd.start_date.to_s)
   end
 
+  it "extends start_date back to peg start when provider data is newer" do
+    # AED is pegged to USD since 1997-11-02. Insert provider data starting much later, but anchor (USD) data going back
+    # further.
+    db = Sequel::Model.db
+    Rate.multi_insert([
+      { provider: "ECB", date: "1990-01-02", base: "EUR", quote: "USD", rate: 1.0 },
+      { provider: "TCMB", date: Date.today, base: "USD", quote: "AED", rate: 3.6725 },
+    ])
+    db[:currencies].insert_conflict(:replace).insert(iso_code: "USD", start_date: "1990-01-02",
+                                                     end_date: Date.today.to_s,)
+    db[:currencies].insert_conflict(:replace).insert(iso_code: "AED", start_date: Date.today.to_s,
+                                                     end_date: Date.today.to_s,)
+    db[:currency_coverages].insert_conflict(:replace).insert(provider_key: "TCMB", iso_code: "AED",
+                                                             start_date: Date.today.to_s, end_date: Date.today.to_s,)
+
+    aed = Currency.find("AED")
+
+    _(aed.start_date.to_s).must_equal("1997-11-02")
+    _(aed.peg).wont_be_nil
+    _(aed.providers).must_include("TCMB")
+  end
+
+  it "extends start_date in currency list for pegged currencies with provider data" do
+    db = Sequel::Model.db
+    Rate.multi_insert([
+      { provider: "ECB", date: "1990-01-02", base: "EUR", quote: "USD", rate: 1.0 },
+      { provider: "TCMB", date: Date.today, base: "USD", quote: "AED", rate: 3.6725 },
+    ])
+    db[:currencies].insert_conflict(:replace).insert(iso_code: "USD", start_date: "1990-01-02",
+                                                     end_date: Date.today.to_s,)
+    db[:currencies].insert_conflict(:replace).insert(iso_code: "AED", start_date: Date.today.to_s,
+                                                     end_date: Date.today.to_s,)
+    db[:currency_coverages].insert_conflict(:replace).insert(provider_key: "TCMB", iso_code: "AED",
+                                                             start_date: Date.today.to_s, end_date: Date.today.to_s,)
+
+    aed = Currency.all.find { |c| c.iso_code == "AED" }
+
+    _(aed.start_date.to_s).must_equal("1997-11-02")
+  end
+
+  it "extends end_date for pegged currency with stale provider data" do
+    db = Sequel::Model.db
+    # ANG is pegged to USD. Insert a stale ANG row (end_date in the past) but USD is current. The peg should extend
+    # ANG's end_date to match USD.
+    db[:currencies].insert_conflict(:replace).insert(iso_code: "ANG", start_date: "1999-01-04", end_date: "2025-03-28")
+    db[:currency_coverages].insert_conflict(:replace).insert(provider_key: "BDI", iso_code: "ANG",
+                                                             start_date: "1999-01-04", end_date: "2025-03-28",)
+
+    usd = Currency.find("USD")
+
+    # find
+    ang = Currency.find("ANG")
+
+    _(ang.end_date.to_s).must_equal(usd.end_date.to_s)
+
+    # all (scope=all)
+    ang_all = Currency.all.find { |c| c.iso_code == "ANG" }
+
+    _(ang_all.end_date.to_s).must_equal(usd.end_date.to_s)
+
+    # active
+    ang_active = Currency.active.find { |c| c.iso_code == "ANG" }
+
+    _(ang_active.end_date.to_s).must_equal(usd.end_date.to_s)
+  end
+
   it "formats pegged currency to hash" do
     bmd = Currency.find("BMD")
 
@@ -112,22 +207,29 @@ describe Currency do
     _(bmd.to_h[:end_date]).wont_be_nil
   end
 
-  it "includes peg metadata in detail hash" do
-    bmd = Currency.find("BMD")
-    h = bmd.to_h_with_providers
+  it "returns peg metadata for pegged currencies" do
+    h = Currency.find("BMD").to_h_with_providers
 
-    _(h[:peg]).wont_be_nil
     _(h[:peg][:base]).must_equal("USD")
     _(h[:peg][:rate]).must_equal(1.0)
     _(h[:peg][:authority]).must_equal("Bermuda Monetary Authority")
-    _(h).wont_include(:providers)
   end
 
-  it "returns providers for non-pegged currency detail" do
-    usd = Currency.find("USD")
-    h = usd.to_h_with_providers
+  it "returns providers for pegged currencies" do
+    h = Currency.find("BMD").to_h_with_providers
 
     _(h[:providers]).must_be_kind_of(Array)
+  end
+
+  it "returns providers for non-pegged currencies" do
+    h = Currency.find("USD").to_h_with_providers
+
+    _(h[:providers]).must_be_kind_of(Array)
+  end
+
+  it "does not return peg metadata for non-pegged currencies" do
+    h = Currency.find("USD").to_h_with_providers
+
     _(h).wont_include(:peg)
   end
 end
