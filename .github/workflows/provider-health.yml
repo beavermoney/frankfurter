@@ -1,8 +1,8 @@
 name: Provider health
 
-# Daily audit for silently-frozen providers. Reads the live /v2/providers feed,
-# flags any provider whose publishes_missed exceeds its cadence threshold, and
-# upserts a single rolling issue (labels: provider + health). See bin/provider_health.rb.
+# Daily read-only audit of the official Frankfurter deployment.
+# Reports stale providers in the run logs without managing GitHub issues.
+# See bin/provider_health.rb.
 
 on:
   schedule:
@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  issues: write
+  contents: read
 
 jobs:
   audit:
@@ -20,5 +20,5 @@ jobs:
       - uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1.321.0
       - run: ruby bin/provider_health.rb
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
+          API: https://api.frankfurter.dev/v2/providers
+          DRY_RUN: "1"
