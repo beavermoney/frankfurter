@@ -1,7 +1,8 @@
 # --- Build stage: compile gems with the full toolchain ---
-FROM ruby:4.0.6-slim AS builder
+FROM ruby:4.0.7-slim AS builder
 
 RUN apt-get update && \
+    apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
     build-essential \
     libyaml-dev && \
@@ -17,9 +18,10 @@ RUN gem install bundler && \
     bundle install
 
 # --- Runtime stage: only what the app needs to run ---
-FROM ruby:4.0.6-slim
+FROM ruby:4.0.7-slim
 
 RUN apt-get update && \
+    apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
     curl \
     libyaml-0-2 && \

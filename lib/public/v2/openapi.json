@@ -22,7 +22,7 @@
       "get": {
         "operationId": "getRates",
         "summary": "Get exchange rates",
-        "description": "Returns exchange rates blended across providers. Without date params, returns the latest rates. Each record is a single currency pair. The response includes an identity record for the base currency (base equals quote, rate 1), subject to the quotes filter like any other record. Daily date ranges of any length are served, including full history. Limit: requests using `providers` or `expand=providers` recompute the blend per date, so at daily granularity they return 422 for ranges longer than 5 years. With `providers` naming at most 5 providers, a `quotes` list of at most 5 currencies lifts the cap; without `providers`, `expand=providers` ranges compute every currency regardless of `quotes`, so aggregate with `group=week` or `group=month`, add `providers`, or split the range into shorter requests.",
+        "description": "Returns exchange rates blended across providers. Without date params, returns the latest rates. Each record is a single currency pair. The response includes an identity record for the base currency (base equals quote, rate 1), subject to the quotes filter like any other record. Daily date ranges of any length are served, including full history. Limit: requests using `providers` or `expand=providers` recompute the blend per date, so at daily granularity they return 422 for ranges longer than 5 years. A single provider is exempt and serves any range. With `providers` naming 2 to 5 providers, a `quotes` list of at most 5 currencies lifts the cap; without `providers`, `expand=providers` ranges compute every currency regardless of `quotes`, so aggregate with `group=week` or `group=month`, add `providers`, or split the range into shorter requests.",
         "parameters": [
           { "$ref": "#/components/parameters/date" },
           { "$ref": "#/components/parameters/from" },
@@ -100,6 +100,159 @@
         }
       }
     },
+    "/providers/{provider}": {
+      "get": {
+        "operationId": "getProvider",
+        "summary": "Get a provider",
+        "description": "One entry from `/providers`, by key (case-insensitive).",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "required": true,
+            "description": "Provider key, case-insensitive. See `/providers` for the list.",
+            "schema": { "type": "string", "example": "ECB" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Provider",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Provider" }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/providers/{provider}/rates": {
+      "get": {
+        "operationId": "getProviderRates",
+        "summary": "Get a provider's exchange rates",
+        "description": "Returns one provider's rates as published, unblended. Identical to `/rates?providers={provider}`: same parameters, same records, same limits. Native-base records carry the provider's published digits; other bases are derived. Sending `providers` here returns 422. Unknown provider returns 404.",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "required": true,
+            "description": "Provider key, case-insensitive. See `/providers` for the list.",
+            "schema": {
+              "type": "string",
+              "example": "ECB"
+            }
+          },
+          { "$ref": "#/components/parameters/date" },
+          { "$ref": "#/components/parameters/from" },
+          { "$ref": "#/components/parameters/to" },
+          { "$ref": "#/components/parameters/base" },
+          { "$ref": "#/components/parameters/quotes" },
+          { "$ref": "#/components/parameters/group" },
+          { "$ref": "#/components/parameters/expand" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Exchange rates",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/Rate" }
+                },
+                "example": [
+                  {
+                    "date": "2024-01-15",
+                    "base": "EUR",
+                    "quote": "EUR",
+                    "rate": 1.0
+                  },
+                  {
+                    "date": "2024-01-15",
+                    "base": "EUR",
+                    "quote": "GBP",
+                    "rate": 0.8623
+                  },
+                  {
+                    "date": "2024-01-15",
+                    "base": "EUR",
+                    "quote": "USD",
+                    "rate": 1.089
+                  }
+                ]
+              },
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string",
+                  "description": "NDJSON stream of Rate objects, one JSON object per line"
+                },
+                "example": "{ \"date\": \"2024-01-15\", \"base\": \"EUR\", \"quote\": \"USD\", \"rate\": 1.089 }\n{ \"date\": \"2024-01-15\", \"base\": \"EUR\", \"quote\": \"GBP\", \"rate\": 0.8623 }\n"
+              }
+            }
+          },
+          "422": { "$ref": "#/components/responses/UnprocessableEntity" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/providers/{provider}/rate/{base}/{quote}": {
+      "get": {
+        "operationId": "getProviderRate",
+        "summary": "Get a single pair from a provider",
+        "description": "Returns one provider's rate for a single currency pair. Identical to `/rate/{base}/{quote}?providers={provider}`. The pair may be published directly or derived from the provider's own rates for both currencies. Returns 404 when the provider has no data for either currency on the date.",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "required": true,
+            "description": "Provider key, case-insensitive. See `/providers` for the list.",
+            "schema": {
+              "type": "string",
+              "example": "ECB"
+            }
+          },
+          {
+            "name": "base",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "example": "EUR"
+            }
+          },
+          {
+            "name": "quote",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "example": "USD"
+            }
+          },
+          { "$ref": "#/components/parameters/date" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Exchange rate",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Rate" },
+                "example": {
+                  "date": "2026-03-25",
+                  "base": "EUR",
+                  "quote": "USD",
+                  "rate": 1.1568
+                }
+              }
+            }
+          },
+          "422": { "$ref": "#/components/responses/UnprocessableEntity" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
     "/currency/{code}": {
       "get": {
         "operationId": "getCurrency",
@@ -136,7 +289,7 @@
           {
             "name": "scope",
             "in": "query",
-            "description": "Set to 'all' to include legacy currencies",
+            "description": "Set to 'all' to include legacy currencies. Omit for the default list. Other values, including an empty string, return 422.",
             "required": false,
             "schema": { "type": "string", "enum": ["all"] }
           },
@@ -157,7 +310,8 @@
                 ]
               }
             }
-          }
+          },
+          "422": { "$ref": "#/components/responses/UnprocessableEntity" }
         }
       }
     },
@@ -244,7 +398,7 @@
       "providers": {
         "name": "providers",
         "in": "query",
-        "description": "Comma-separated list of data providers to include",
+        "description": "Comma-separated list of data providers to include. A single provider includes its stored non-currency series. Selecting multiple providers blends only registered currencies and accounting units.",
         "required": false,
         "schema": {
           "type": "string",
@@ -285,11 +439,11 @@
           },
           "base": {
             "type": "string",
-            "description": "Base currency code"
+            "description": "Base currency or accounting unit code"
           },
           "quote": {
             "type": "string",
-            "description": "Quote currency code"
+            "description": "Quote currency or accounting unit code"
           },
           "rate": {
             "type": "number",
@@ -316,7 +470,7 @@
       "Currency": {
         "type": "object",
         "properties": {
-          "iso_code": { "type": "string", "description": "ISO 4217 currency code" },
+          "iso_code": { "type": "string", "description": "Currency or accounting unit code" },
           "iso_numeric": { "type": ["string", "null"], "description": "ISO 4217 numeric code" },
           "name": { "type": "string", "description": "Full currency name" },
           "symbol": { "type": ["string", "null"], "description": "Currency symbol" },
@@ -328,7 +482,7 @@
       "CurrencyDetail": {
         "type": "object",
         "properties": {
-          "iso_code": { "type": "string", "description": "ISO 4217 currency code" },
+          "iso_code": { "type": "string", "description": "Currency or accounting unit code" },
           "iso_numeric": { "type": ["string", "null"], "description": "ISO 4217 numeric code" },
           "name": { "type": "string", "description": "Full currency name" },
           "symbol": { "type": ["string", "null"], "description": "Currency symbol" },
@@ -364,18 +518,28 @@
           "end_date": { "type": ["string", "null"], "format": "date", "description": "Latest available date" },
           "publish_cadence": {
             "type": ["string", "null"],
-            "enum": ["daily", "weekly", "monthly", null],
-            "description": "How often the provider publishes rates. Determines the unit of publishes_missed: a count of days, ISO weeks, or calendar months. Null for historical-only providers with no scheduled cadence."
+            "enum": ["daily", "weekly", "monthly", "quarterly", null],
+            "description": "How often the provider publishes rates. Determines the unit of publishes_missed: a count of days, ISO weeks, calendar months, or calendar quarters. Null for historical-only providers with no scheduled cadence."
           },
-          "publishes_missed": {
+          "frequency": {
+          "type": "string",
+          "enum": ["daily", "monthly", "quarterly"],
+          "description": "The period each observation stands for, after SDMX FREQ. A daily value is dated on the day observed. A monthly or quarterly value is dated on the day it takes effect and stands for the period until the next one. Values coarser than daily never enter the blend: query them by provider."
+        },
+        "publishes_missed": {
             "type": ["integer", "null"],
             "minimum": 0,
-            "description": "Number of expected publishes missed since end_date, in units of publish_cadence. For daily providers, counts scheduled publish days strictly between end_date and today. For weekly and monthly providers, counts ISO weeks or calendar months between the latest imported bucket and the bucket whose publish window has already started. Null when the provider has no scheduled cadence or no imported data."
+            "description": "Number of expected publishes missed since end_date, in units of publish_cadence. For daily providers, counts scheduled publish days strictly between end_date and today. For weekly, monthly and quarterly providers, counts ISO weeks, calendar months or calendar quarters between the latest imported bucket and the bucket whose publish window has already started. Null when the provider has no scheduled cadence or no imported data."
           },
           "currencies": {
             "type": "array",
             "items": { "type": "string" },
-            "description": "Currency codes covered by this provider"
+            "description": "Recognised currency codes within their valid date ranges covered by this provider"
+          },
+          "unknown_currencies": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Unreviewed published codes absent from the currency registry. Available through single-provider rates but excluded from blends and the currency catalogue. Known non-currency series do not trigger this alert."
           }
         },
         "required": ["key", "name", "currencies"]
@@ -409,7 +573,13 @@
         }
       },
       "ServiceUnavailable": {
-        "description": "The request deadline expired before the response could be computed. Retry with a narrower request: filter with quotes, aggregate with group, or split the range into shorter requests.",
+        "description": "The request deadline expired before the response could be computed, or the worker process is already running its limit of concurrent live daily-range computes (any daily range served live: with providers, with expand=providers, or before the precomputed blend is ready). In the second case a Retry-After header says how many seconds to wait before retrying. Otherwise retry with a narrower request: filter with quotes, aggregate with group, or split the range into shorter requests.",
+        "headers": {
+          "Retry-After": {
+            "description": "Seconds to wait before retrying. Sent when the server is at its limit of concurrent daily range computes.",
+            "schema": { "type": "integer" }
+          }
+        },
         "content": {
           "application/json": {
             "schema": {

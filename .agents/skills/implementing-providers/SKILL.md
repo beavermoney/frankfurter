@@ -26,6 +26,22 @@ Stop and skip the provider if either of these is true:
 
 If the provider has a real archive (downloadable history reaching back years, not just the current snapshot), proceed. Note `coverage_start` from the earliest archive date and continue with the checklist.
 
+### Licence: when terms block a provider
+
+Find the source's terms or legal page and record it as `terms_url` (null if there is none). Read it. A licence blocks a provider only when it explicitly forbids what Frankfurter does: free redistribution of published official rates, with attribution, by a non-commercial open-source service.
+
+**Proceed** on any of these:
+
+- Attribution-only terms.
+- Non-commercial-only clauses. Frankfurter has no paid tier and no API key, so "may be used for non-commercial purposes with acknowledgement" describes us rather than excludes us.
+- Generic "no reproduction or distribution without written permission" boilerplate. Nearly every state-affiliated site carries it; it is aimed at commercial resale of market data, and a published reference rate is an official announcement, not a data product.
+
+In the last case, ship with attribution and send a short courtesy notice to the institution's general contact: who we are, what we republish, and that we will remove it on request. Do not hold the PR on a reply. Quote the clause in the PR's License section so the call is on record.
+
+**Stop** only when the terms single out what we do (free or non-commercial redistribution, aggregators, APIs, automated access) or when the institution has already asked us to stop.
+
+A takedown request is handled like any other provider loss: remove the adapter, seed, cassette and rows, and note it on the provider's issue.
+
 ## Implementation Checklist
 
 ### 1. Adapter class — `lib/provider/adapters/<key>.rb`
@@ -74,9 +90,37 @@ The base class provides a private `http` method (an `HTTP::Client` from the `htt
 - **Semantic failures** (the response is 200 but doesn't contain what the adapter expects: a missing download link, an empty workbook) raise `RuntimeError` with a message that names the provider and what went wrong, e.g. `raise "no workbook link on #{DATA_URL}"` (see `lib/provider/adapters/cbs.rb`).
 - **Timeouts**: the shared client sets connect 10s, write 60s, read 120s. The read deadline is per socket read (it resets on every chunk), so slow-but-steady downloads never trip it; only a server silent for over two minutes does. No per-adapter tuning.
 - **Exotic patterns**: reach for these only when a provider needs them:
-  - Legacy TLS: pass a per-request `ssl_context` (see `lib/provider/adapters/bcn.rb`, `boa.rb`, `rbv.rb`).
+  - Custom TLS trust: pass a per-request `ssl_context` (see `lib/provider/adapters/boa.rb`, `rbv.rb`).
   - `http.persistent(BASE_URL) { |client| ... }` for endpoints that misbehave across separate connections, or where you want exact parity with a legacy single-connection flow (see `lib/provider/adapters/bota.rb`).
   - Cookie-based login legs: read `response.headers.get("Set-Cookie")` off the first response and forward it on the next request (see `lib/provider/adapters/cbe.rb`, `mas.rb`, `bi.rb`, `nbc.rb`).
+
+#### Redenominated and relabelled currencies
+
+Archives often label a currency's whole history with its current ISO code. Before trusting a code, dump one file per year and look for a 1000x-plus jump in a value at a known redenomination date. Two flavours, handled differently:
+
+- **Restated series.** The source converted old values into the successor unit. ECB and TCMB publish pre-2005 TRY as TRL divided by a million, so 2004 reads `EUR/TRY 1.829`. Relay as published: it is what the issuing bank itself reports, and the series is continuous.
+- **Relabelled only.** The values are the predecessor's magnitudes under the successor code. CBAR's 2005-12-30 file quotes `1 USD = 4593 "AZN"`, old manat; LB's AZN series is the same. Map the code back to the predecessor by date in the adapter with a `PREDECESSORS` table (see `lib/provider/adapters/cbar.rb`, `lb.rb`):
+  ```ruby
+  PREDECESSORS = { "AZN" => ["AZM", Date.new(2006, 1, 9)] }.freeze
+  ```
+  Key each entry on the *source's* switch date, which can trail the official one (LB kept quoting old manat until 2006-01-09), and verify it against the rows either side. Check the nominal at the same time: CBAR's TRL rows say Nominal 1 but price 1000 TRL.
+
+Two more things the relabel needs:
+
+Current databases also have `blended_weekly_rates` and `blended_monthly_rates`. For new repair migrations, invalidate complete affected grouped buckets in the same transaction as provider rollup changes, including old bucket dates that disappear. Startup population or a subsequent `rake blend:rebuild` fills the gaps. Insert-driven refresh cannot repair omitted dates. Follow `AGENTS.md`'s "Replacing provider history" procedure for delete-and-refetch repairs; do not delete only the three provider tables.
+
+- `db/seeds/currency_patches.json` must know the predecessor for it to enter the blend and catalogue. Unknown codes are stored and served by provider routes, and provider health flags them. The Money gem lacks some historical codes (AZM, RUR); add a full entry.
+- Rows already stored under the wrong code stay put: the insert is `ON CONFLICT DO NOTHING` and the corrected rows have a different key. Relabel them in place with a migration (see `db/migrate/027_relabel_lb_old_manat.rb`), which runs itself at container start. No re-backfill: the values were right, only the code was wrong. The migration has four parts, because three tables derive from `rates`:
+  1. `UPDATE rates` scoped to provider, code and date range.
+  2. Rollups: delete the provider's `weekly_rates` and `monthly_rates` for both codes and re-insert from `rates` with `Bucket.week` / `Bucket.month`, the way `Provider#refresh_rollup` does. A bucket straddling the cutover holds both codes.
+  3. Summaries: `currencies` and `currency_coverages` only ever widen on insert, so recompute both codes from `rates`.
+  4. Blend: `blended_rates` refreshes on insert only. Where the provider was the *sole* contributor for the code, `UPDATE` the quote; the stored value is a pure function of those rows and a recompute gives the same bytes. Where other providers already quote the successor, `BlendedRate.refresh` the window plus the 14-day carry-forward lookback past the provider's last old-unit row. Check contributor sets with `SELECT provider, MIN(date) FROM rates WHERE base = ? OR quote = ? GROUP BY provider`.
+
+  Verify against a prod backup: apply the migration to a copy, recompute the blend from scratch over the affected years on a second copy, and diff `blended_rates`. Zero rows either way, or the migration is wrong.
+
+`db/seeds/nascent_currencies.json` applies globally, including restated series, so it is reserved for universal relabels such as pre-1999 EUR to XEU. Before inception, ingestion uses the configured predecessor and drops the row only if none is known. Keep provider-specific switch dates in the adapter.
+
+Non-ISO labels (`SDR` for XDR) go through an `ALIASES` map rather than the predecessor table.
 
 ### 2. Tests — `spec/provider/adapters/<key>_spec.rb`
 
@@ -131,7 +175,7 @@ ecb_rates = Rate.where(provider: "ECB").where(date: Date.today - 7..Date.today).
 | > 5% | Almost certainly a bug (e.g. base/quote inverted) |
 
 **What to look for:**
-- Rates that are the reciprocal of expected (base/quote swapped) — this was the HNB bug — see 'Rate direction' principle above
+- Rates that are the reciprocal of expected (base/quote swapped) — see 'Rate direction' principle above
 - Rates that are 10x or 100x off (unit multiplier not normalized)
 - Rates that match another provider exactly but on wrong dates (date parsing bug)
 

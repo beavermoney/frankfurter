@@ -4,6 +4,9 @@ require "digest"
 
 require "roda"
 require "blended_rate"
+require "blended_weekly_rate"
+require "blended_monthly_rate"
+require "heavy_slots"
 require "rate"
 require "request_timeout"
 require "weekly_rate"
@@ -35,12 +38,21 @@ module Versions
       MAX_DAILY_RANGE_QUOTES = 5
       MAX_DAILY_RANGE_PROVIDERS = 5
       PIVOT = "USD"
+      HEAVY_SLOTS = HeavySlots.new
+
+      class << self
+        # One counter per process so every request a Puma worker serves draws on the same cap; tests swap in a smaller
+        # one.
+        def heavy_slots = HEAVY_SLOTS
+      end
 
       # Parity harness only: forces the live compute path so the materialized table can be compared against it byte for
       # byte.
       attr_writer :force_live
+      attr_reader :rollup_coverage
 
       def initialize(params, timeout = RequestTimeout::DEFAULT_SECONDS)
+        @rollup_coverage = { materialized: 0, fallback: 0, empty: 0 }
         @params = params
         @timeout = timeout
         @deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
@@ -65,8 +77,8 @@ module Versions
         elsif blended_table?
           each_blended_snapshot(&block)
         else
-          window = raw_dataset.where(date: (date_scope - CarryForward::LOOKBACK_DAYS)..date_scope)
-          rows = CarryForward.apply(window.naked.all, date: date_scope)
+          window = raw_dataset.where(date: (date_scope - lookback)..date_scope)
+          rows = CarryForward.apply(window.naked.all, date: date_scope, lookback:)
           emit_blended(rows, &block)
         end
       end
@@ -89,19 +101,51 @@ module Versions
         expand&.include?("providers") || false
       end
 
+      # Returns the heavy slot this query holds, if any. Idempotent on purpose: each_daily_range's ensure returns it
+      # after a drained or failed enumeration, and the route's stream callback returns it when a client disconnects
+      # mid-stream and strands the enumerator fiber, whose ensure never runs.
+      def release_slot
+        slots = @heavy_slot
+        @heavy_slot = nil
+        slots&.release
+      end
+
       private
+
+      def acquire_slot!
+        slots = self.class.heavy_slots
+        unless slots.try_acquire
+          raise HeavySlots::Busy,
+                "too many range computes in progress; retry after #{HeavySlots::RETRY_AFTER_SECONDS}s"
+        end
+
+        @heavy_slot = slots
+      end
 
       def max_date
         ds = raw_dataset
         if date_scope.is_a?(Range)
           ds.where(date: date_scope).max(:date)
         else
-          ds.where(date: (date_scope - CarryForward::LOOKBACK_DAYS)..date_scope).max(:date)
+          ds.where(date: (date_scope - lookback)..date_scope).max(:date)
         end
       end
 
       def each_rollup_range(&)
         each_chunk(date_scope) do |chunk_range|
+          unless @force_live || providers || expand_providers?
+            stored = blended_rollup_model.read(chunk_range)
+            if stored
+              @rollup_coverage[stored.empty? ? :empty : :materialized] += 1
+              stored.group_by { |row| row[:date] }.each_value do |rows|
+                blended = base == PIVOT ? rows : derive(rows, target: base)
+                emit_records(blended, rows, &)
+              end
+              next
+            end
+          end
+
+          @rollup_coverage[:fallback] += 1
           ds = range_dataset
           date_col = ds.model.date_column
 
@@ -172,15 +216,20 @@ module Versions
       # When the range start is silent, anchor CF on it as well so the response surfaces the most recent prior data —
       # same blend ?date=chunk_range.begin would produce (mirrors Rate.between's snap-back, #71). Dedupe on (quote,
       # observation_date) so a pair whose contributor set hasn't changed doesn't reappear.
+      #
+      # This is the heavy path: the shapes validate_range_cost! bounds (providers=, expand=providers, and the not-ready
+      # fallback) recompute the blend per date, so it draws on the process-wide slot cap and releases the slot however
+      # the enumeration ends (#650). Table-served ranges, rollups, latest and single dates never come through here.
       def each_daily_range
+        acquire_slot!
         seen = Set.new
         each_chunk(date_scope) do |chunk_range|
-          lookback_start = chunk_range.begin - CarryForward::LOOKBACK_DAYS
+          lookback_start = chunk_range.begin - lookback
           rows = raw_dataset.where(date: lookback_start..chunk_range.end).naked.all
           all_dates = rows.map { |r| r[:date] }.uniq
           anchors = all_dates.select { |d| chunk_range.cover?(d) }.sort
           anchors.unshift(chunk_range.begin) unless all_dates.include?(chunk_range.begin)
-          CarryForward.each_snapshot(rows, dates: anchors) do |_anchor, contributors|
+          CarryForward.each_snapshot(rows, dates: anchors, lookback:) do |_anchor, contributors|
             next if contributors.empty?
 
             emit_blended(contributors) do |record|
@@ -192,10 +241,16 @@ module Versions
             end
           end
         end
+      ensure
+        release_slot
       end
 
       def rollup?
         range? && ["week", "month"].include?(group)
+      end
+
+      def blended_rollup_model
+        group == "week" ? BlendedWeeklyRate : BlendedMonthlyRate
       end
 
       def rollup_model
@@ -210,7 +265,17 @@ module Versions
       # metals), so a filtered request disagreed with an unfiltered one about the same pair. The blend is computed from
       # the full row set everywhere (#570).
       def apply_filters(dataset)
-        providers ? dataset.where(provider: providers) : dataset
+        return dataset.blendable unless providers
+
+        selected = dataset.where(provider: providers)
+        providers.uniq.size == 1 ? selected : RateScopes.named_currencies(selected)
+      end
+
+      # Carry-forward window: the named providers' own, else the blend's (#646).
+      def lookback
+        return CarryForward::LOOKBACK_DAYS unless providers
+
+        providers.filter_map { |k| Provider[k]&.lookback_days }.max || CarryForward::LOOKBACK_DAYS
       end
 
       def raw_dataset
@@ -261,8 +326,9 @@ module Versions
 
       def parse_date(value)
         return unless value
+        return unless /\A\d{4}-\d{2}-\d{2}\z/.match?(value)
 
-        Date.parse(value)
+        Date.iso8601(value)
       rescue Date::Error
         nil
       end
@@ -305,14 +371,26 @@ module Versions
 
       def validate_currencies!
         invalid = []
-        invalid << base if @params[:base] && !Money::Currency.find(base)
-        invalid.concat(quotes.reject { |q| Money::Currency.find(q) }) if quotes
+        invalid << base if @params[:base] && !available_currency?(base)
+        invalid.concat(quotes.reject { |q| available_currency?(q) }) if quotes
         raise ValidationError, "invalid currency: #{invalid.join(",")}" if invalid.any?
+      end
+
+      def available_currency?(code)
+        return true if Money::Currency.find(code)
+        return false unless providers && providers.uniq.size == 1
+
+        Rate.where(provider: providers).where(Sequel.|({ base: code }, { quote: code })).any?
       end
 
       def validate_range_cost!
         return unless range? && !rollup?
         return if !providers && !expand_providers? && BlendedRate.ready?
+
+        # One provider is a fetch plus a one-contributor blend per date, not a cross-provider recompute: measured in
+        # prod at 7s for five years of the largest provider (BDI, 173 quotes), so full history stays inside the request
+        # deadline (#644).
+        return if providers && providers.uniq.size == 1
 
         # A SHORT provider list bounds the fetch, so a small quotes list on top stays cheap; naming every provider
         # reproduces the unbounded workload, hence the provider-count bound. Nothing else bounds work anymore: quotes=
@@ -404,9 +482,11 @@ module Versions
       end
 
       def pivot_path_blend(rows)
-        # Restricting the source set bypasses the peg layer entirely, so a pegged request base has no anchor to rebase
-        # through; mirror the fast path's refusal instead of answering from whatever the named providers happen to
-        # publish.
+        # One provider is that provider's own view, pegged base or not: its cross is the answer the caller asked for.
+        return single_provider_blend(rows) if providers && providers.uniq.size == 1
+        # Restricting the source set to several providers bypasses the peg layer entirely, so a pegged request base has
+        # no anchor to rebase through; mirror the fast path's refusal instead of answering from whatever the named
+        # providers happen to publish.
         return [] if providers && base_peg
 
         blended = Blender.new(rows, base: PIVOT).blend
@@ -415,6 +495,22 @@ module Versions
         return blended if base == PIVOT
 
         derive(blended, target: base)
+      end
+
+      # One provider has nothing to blend against, so its rows skip the pivot frame: the request base is reached by one
+      # hop through the provider's own base rather than a round trip through USD. That keeps rows the provider never
+      # bridged to USD, and derives each pair from two rows instead of four (#645). The contributor entry mirrors the
+      # row so expand=providers keeps its shape.
+      def single_provider_blend(rows)
+        # Rollup chunks arrive as model instances; the daily paths as naked hashes. BaseConversion wants hashes.
+        rows = rows.map { |r| r.is_a?(Sequel::Model) ? r.values : r }
+        converted = BaseConversion.new(rows, base:).convert
+        # A provider mid-transition between pivot currencies (LB around Lithuania's euro adoption) reaches one quote
+        # through two bridges dated differently: the carried-forward old-base row and the new-base row. One record per
+        # pair, and the newer observation wins, as everywhere else carry-forward applies.
+        converted.group_by { |r| r[:quote] }.map { |_, group| group.max_by { |r| r[:date] } }.map do |r|
+          r.except(:provider).merge(providers: [{ key: r[:provider], date: r[:date], rate: r[:rate] }])
+        end
       end
 
       def normalize_dates!(rows, date_col)

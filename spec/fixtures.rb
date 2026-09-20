@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "bucket"
+require "provider"
 require "rate"
 
 # Generates realistic test data for ECB and BOC providers. All dates are relative to today so tests never go stale.
@@ -39,8 +40,9 @@ module Fixtures
 
   class << self
     def seed!
+      Provider.seed
       Rate.dataset.delete
-      Sequel::Model.db[:blended_rates].delete
+      [:blended_rates, :blended_weekly_rates, :blended_monthly_rates].each { |table| Sequel::Model.db[table].delete }
       generate_rates.each_slice(1000) do |batch|
         Rate.dataset.multi_insert(batch)
       end
@@ -141,11 +143,11 @@ module Fixtures
           if config[:mixed]
             config[:mixed].each do |pair|
               records << { provider:, date:, base: pair[:base], quote: pair[:quote],
-                           rate: (pair[:rate] * jitter).round(4), }
+                           mid: (pair[:rate] * jitter).round(4), }
             end
           else
             config[:quotes].each do |quote, rate|
-              records << { provider:, date:, base: config[:base], quote:, rate: (rate * jitter).round(4) }
+              records << { provider:, date:, base: config[:base], quote:, mid: (rate * jitter).round(4) }
             end
           end
         end

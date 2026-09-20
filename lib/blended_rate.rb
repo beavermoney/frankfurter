@@ -29,22 +29,44 @@ class BlendedRate < Sequel::Model(:blended_rates)
       chunks(window).each { |chunk| refresh_chunk(chunk) }
     end
 
-    # Newest-first, so ready? (coverage of the oldest rate date) flips only when the final chunk lands and a rebuild in
-    # progress never looks complete.
+    # Rebuilds in place newest-first: existing chunks remain readable throughout the run so ready? stays true and
+    # requests never fall back to live compute. Stale leading rows are pruned upfront under an immediate transaction so
+    # an active-range shrink preserves readiness immediately. Chunks replace themselves transactionally, and a final
+    # immediate sweep re-checks bounds to prune rows outside the active date range without racing concurrent backfills.
     def rebuild
-      dataset.delete
-      first = Rate.dataset.min(:date)
-      return unless first
+      window = db.transaction(mode: :immediate) do
+        first = Rate.blendable.min(:date)
+        if first
+          min = Date.parse(first)
+          dataset.where { date < min }.delete
+          min..Date.parse(Rate.blendable.max(:date))
+        else
+          dataset.delete
+          nil
+        end
+      end
+      return unless window
 
-      chunks(Date.parse(first)..Date.parse(Rate.dataset.max(:date))).reverse_each do |chunk|
+      chunks(window).reverse_each do |chunk|
         refresh_chunk(chunk)
+      end
+
+      db.transaction(mode: :immediate) do
+        bounds = Rate.blendable.select(
+          Sequel.function(:min, :date).as(:min),
+          Sequel.function(:max, :date).as(:max),
+        ).first
+        next unless bounds[:min]
+
+        active_window = Date.parse(bounds[:min])..Date.parse(bounds[:max])
+        dataset.exclude(date: active_window).delete
       end
     end
 
     # The table serves reads only once it covers full history: an incremental refresh makes it non-empty long before
     # blend:rebuild has run, and serving a partial table would silently truncate historical ranges.
     def ready?
-      first_rate = Rate.dataset.min(:date)
+      first_rate = Rate.blendable.min(:date)
       !first_rate.nil? && dataset.min(:date) == first_rate
     end
 
@@ -67,7 +89,7 @@ class BlendedRate < Sequel::Model(:blended_rates)
     def refresh_chunk(chunk)
       db.transaction(**(db.in_transaction? ? {} : { mode: :immediate })) do
         lookback_start = chunk.begin - CarryForward::LOOKBACK_DAYS
-        rows = Rate.dataset.where(date: lookback_start..chunk.end).naked.all
+        rows = Rate.blendable.where(date: lookback_start..chunk.end).naked.all
         anchors = rows.map { |r| r[:date] }.uniq.select { |d| chunk.cover?(d) }.sort
 
         buffer = []

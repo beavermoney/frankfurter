@@ -28,7 +28,8 @@ describe Provider do
         _(data).must_include("publish_cadence")
         _(data).wont_include("publish_time")
         _(data).wont_include("publish_days")
-        _([nil, "daily", "weekly", "monthly"]).must_include(data["publish_cadence"])
+        _([nil, "daily", "weekly", "monthly", "quarterly"]).must_include(data["publish_cadence"])
+        _([nil, "daily", "monthly", "quarterly"]).must_include(data["frequency"])
         _(data["publish_cadence"].nil?).must_equal(data["publish_schedule"].nil?)
         next if data["publish_schedule"].nil?
 
@@ -60,6 +61,57 @@ describe Provider do
       Provider.all.each do |provider|
         _(Provider::Adapters.const_defined?(provider.key)).must_equal(true)
       end
+    end
+  end
+
+  describe ".seed" do
+    it "keeps a key only some seed files carry" do
+      Provider.seed
+
+      _(Provider["UST"].frequency).must_equal("quarterly")
+      _(Provider["ECB"].frequency).must_equal("daily")
+      _(Provider.non_blending_keys).must_include("UST")
+    end
+  end
+
+  describe "#frequency" do
+    it "defaults to daily, blends, and carries forward two weeks" do
+      provider = Provider.new { |p| p.key = "EXAMPLE" }
+
+      _(provider.frequency).must_equal("daily")
+      _(provider.blends?).must_equal(true)
+      _(provider.lookback_days).must_equal(14)
+    end
+
+    it "keeps monthly and quarterly values out of the blend and carries them across their period" do
+      monthly = Provider.new { |p| p.frequency = "monthly" }
+      quarterly = Provider.new { |p| p.frequency = "quarterly" }
+
+      _(monthly.blends?).must_equal(false)
+      _(monthly.lookback_days).must_equal(45)
+      _(quarterly.blends?).must_equal(false)
+      _(quarterly.lookback_days).must_equal(120)
+    end
+
+    it "widens the carry-forward window to the publish cadence when values arrive in arrears" do
+      in_arrears = Provider.new { |p| p.publish_cadence = "monthly" }
+      weekly = Provider.new { |p| p.publish_cadence = "weekly" }
+      unscheduled = Provider.new { |p| p.publish_cadence = nil }
+
+      _(in_arrears.blends?).must_equal(true)
+      _(in_arrears.lookback_days).must_equal(45)
+      _(weekly.lookback_days).must_equal(14)
+      _(unscheduled.lookback_days).must_equal(14)
+    end
+
+    it "lists the keys of providers that do not blend" do
+      Provider.dataset.insert(key: "TST", name: "Test", frequency: "monthly")
+      Provider.load_cache
+
+      _(Provider.non_blending_keys).must_include("TST")
+    ensure
+      Provider.dataset.where(key: "TST").delete
+      Provider.load_cache
     end
   end
 
@@ -227,6 +279,22 @@ describe Provider do
       end
     end
 
+    describe "with quarterly cadence (Treasury-style, fires early in the quarter)" do
+      let(:ust) { build_provider("0 12 1-10 1,4,7,10 *", cadence: "quarterly") }
+
+      it "returns 0 when the latest quarter-end is the last one due" do
+        ust.stub(:end_date, "2026-03-31") do
+          _(ust.publishes_missed(reference_date: Date.new(2026, 5, 20))).must_equal(0)
+        end
+      end
+
+      it "counts each quarter missed once its window has started" do
+        ust.stub(:end_date, "2025-09-30") do
+          _(ust.publishes_missed(reference_date: Date.new(2026, 5, 20))).must_equal(2)
+        end
+      end
+    end
+
     describe "with monthly cadence on a daily weekday schedule (CBC-style)" do
       # CBC polls a multi-currency open-data file refreshed in monthly batches in arrears: April's daily rows all land
       # in early May. The schedule stays daily so the scheduler keeps polling and catches each batch promptly, but the
@@ -290,7 +358,61 @@ describe Provider do
       _(Rate.where(provider: provider.key, date: import_date).count).must_equal(1)
     end
 
-    it "excludes unrecognised currency codes" do
+    describe "when the adapter revises published values in place" do
+      # HMRC may correct a monthly customs rate mid-month. If the correction replaces the row in its file rather than
+      # adding one with a later start date, insert-only backfill keeps the stale figure. Surface the drift.
+      let(:revising_adapter) { Class.new(adapter) { def self.revises? = true } }
+
+      before do
+        Rate.create(provider: provider.key, date: import_date, base: "EUR", quote: "USD", mid: 1.0)
+      end
+
+      it "warns when a fetched value differs from the stored row" do
+        logged = nil
+        Log.stub(:warn, ->(message) { logged = message }) do
+          provider.stub(:adapter, revising_adapter) { provider.backfill(after: import_date - 1) }
+        end
+
+        _(logged).must_include("#{provider.key}: 1 stored rate differs from source")
+        _(logged).must_include("#{import_date} EUR/USD stored 1.0 fetched 1.1")
+      end
+
+      it "keeps the stored value" do
+        Log.stub(:warn, ->(_) {}) do
+          provider.stub(:adapter, revising_adapter) { provider.backfill(after: import_date - 1) }
+        end
+
+        _(Rate.where(provider: provider.key, date: import_date, quote: "USD").first.rate).must_equal(1.0)
+      end
+
+      it "stays quiet for an adapter that does not revise" do
+        logged = nil
+        Log.stub(:warn, ->(message) { logged = message }) do
+          provider.stub(:adapter, adapter) { provider.backfill(after: import_date - 1) }
+        end
+
+        _(logged).must_be_nil
+      end
+    end
+
+    it "keeps a forward-dated row for an adapter with a publication lead" do
+      ahead = Date.today + 14
+      leading_adapter = Class.new(Provider::Adapters::Adapter) do
+        def self.lead_days = 31
+
+        define_method(:fetch) do |**|
+          [{ date: ahead, base: "EUR", quote: "USD", rate: 1.1 }]
+        end
+      end
+
+      provider.stub(:adapter, leading_adapter) do
+        provider.backfill
+      end
+
+      _(Rate.where(provider: provider.key, date: ahead).count).must_equal(1)
+    end
+
+    it "retains unrecognised currency codes" do
       bad_adapter = Class.new(Provider::Adapters::Adapter) do
         define_method(:fetch) do |**|
           [
@@ -304,7 +426,7 @@ describe Provider do
         provider.backfill
       end
 
-      _(Rate.where(provider: provider.key, quote: "SDR").count).must_equal(0)
+      _(Rate.where(provider: provider.key, quote: "SDR").count).must_equal(1)
     end
 
     it "excludes non-positive rates" do
@@ -397,11 +519,11 @@ describe Provider do
       _(Rate.where(provider: provider.key, quote: "USD", date: Date.today + 1).count).must_equal(1)
     end
 
-    it "drops records dated on or after a defunct currency's terminal date" do
+    it "retains records dated on or after a defunct currency's terminal date" do
       defunct_adapter = Class.new(Provider::Adapters::Adapter) do
         define_method(:fetch) do |**|
           [
-            # BYR retired 2016-07-01 — these should be dropped
+            # Retain the source's observations after BYR retired on 2016-07-01.
             { date: Date.new(2016, 7, 1), base: "EUR", quote: "BYR", rate: 22000.0 },
             { date: Date.new(2017, 1, 1), base: "BYR", quote: "USD", rate: 0.00005 },
             # Keep: before terminal date
@@ -416,8 +538,8 @@ describe Provider do
         provider.backfill
       end
 
-      _(Rate.where(provider: provider.key, quote: "BYR", date: Date.new(2016, 7, 1)).count).must_equal(0)
-      _(Rate.where(provider: provider.key, base: "BYR", date: Date.new(2017, 1, 1)).count).must_equal(0)
+      _(Rate.where(provider: provider.key, quote: "BYR", date: Date.new(2016, 7, 1)).count).must_equal(1)
+      _(Rate.where(provider: provider.key, base: "BYR", date: Date.new(2017, 1, 1)).count).must_equal(1)
       _(Rate.where(provider: provider.key, quote: "BYR", date: Date.new(2016, 6, 30)).count).must_equal(1)
       _(Rate.where(provider: provider.key, quote: "USD", date: Date.new(2016, 7, 1)).count).must_equal(1)
     end
@@ -511,7 +633,7 @@ describe Provider do
 
     it "skips when already up to date" do
       Rate.dataset.insert(
-        date: Date.today, provider: provider.key, base: "EUR", quote: "USD", rate: 1.1,
+        date: Date.today, provider: provider.key, base: "EUR", quote: "USD", mid: 1.1,
       )
 
       called = false
@@ -532,7 +654,7 @@ describe Provider do
     it "chunks when adapter has backfill_range" do
       since = Date.today - 90
       Rate.dataset.insert(
-        date: since, provider: provider.key, base: "EUR", quote: "USD", rate: 1.0,
+        date: since, provider: provider.key, base: "EUR", quote: "USD", mid: 1.0,
       )
 
       ranged_adapter = Class.new(adapter) do

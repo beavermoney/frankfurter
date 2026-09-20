@@ -10,8 +10,10 @@ require "json"
 require "log"
 require "money/currency"
 require "currency_coverage"
+require "currency_summary"
 require "provider/adapters/adapter"
 require "rate"
+require "rate_components"
 require "rate_precision"
 require "rate_validation"
 
@@ -20,30 +22,83 @@ class Provider < Sequel::Model(:providers)
 
   one_to_many :rates, key: :provider
   one_to_many :currency_coverages, key: :provider_key
+  one_to_many :currency_exclusions, key: :provider_key
   many_to_many :currencies, join_table: :currency_coverages, left_key: :provider_key, right_key: :iso_code
 
+  # Carry-forward window per observation frequency and publish cadence (#646). A daily value goes stale in two weeks; a
+  # monthly or quarterly value stands for its whole period plus the lag before the next one lands.
+  LOOKBACK_DAYS = { "daily" => 14, "weekly" => 14, "monthly" => 45, "quarterly" => 120 }.freeze
+
+  # Reviewed non-currency labels remain available in provider history without triggering unknown-currency alerts.
+  NON_CURRENCY_CODES = { "NB" => ["I44", "TWI"], "RBA" => ["FXRTWI"] }.freeze
+
   class << self
+    # Keys of providers whose values stand for longer than a day. Their rows never enter the blend or the currency
+    # catalogue: a value that stands for a month or a quarter is observed once and served for the whole period, so on
+    # most days it is weeks stale, and the recency decay, which counts from the row date, cannot see that.
+    def non_blending_keys
+      all.reject(&:blends?).map(&:key)
+    end
+
     # Provider metadata is config-as-data — JSON files in db/seeds/providers are the source of truth. Re-seeding on
     # every boot syncs changes from the image (new providers, updated schedules) without manual intervention.
     def seed
       dir = File.expand_path("../db/seeds/providers", __dir__)
       data = Dir["#{dir}/*.json"].map { |f| JSON.parse(File.read(f)) }
+      # multi_insert takes its column list from the first row, so a key only some files carry (frequency) would be
+      # dropped from the rest. Normalise every row to the union of keys first.
+      keys = data.flat_map(&:keys).uniq
+      rows = data.map { |d| keys.to_h { |k| [k, d.fetch(k) { k == "frequency" ? "daily" : nil }] } }
       dataset.delete
-      dataset.multi_insert(data)
+      dataset.multi_insert(rows)
       load_cache
+      return unless db.table_exists?(:currency_exclusions)
+
+      recognized = db[:currency_exclusions].select_map(:iso_code).uniq.select { |code| Money::Currency.find(code) }
+      return if recognized.empty?
+
+      counterparts = db[:rates].where(Sequel.|({ base: recognized }, { quote: recognized }))
+        .select(:base, :quote).distinct.all.flat_map(&:values)
+      CurrencySummary.refresh(db, recognized | counterparts)
     end
+  end
+
+  # Older migrations load Provider before the exclusions table exists.
+  def currency_exclusions(*)
+    require "currency_exclusion"
+    super
+  end
+
+  def unknown_currencies
+    codes = currency_exclusions.map(&:iso_code) - NON_CURRENCY_CODES.fetch(key, [])
+    codes.reject { |code| Money::Currency.find(code) }.sort
   end
 
   def adapter
     Adapters.const_get(key)
   end
 
+  def frequency
+    super || "daily"
+  end
+
+  def blends?
+    frequency == "daily"
+  end
+
+  # The wider of the frequency and cadence windows. A provider that releases a month of daily fixings in arrears has
+  # nothing newer than the last batch for weeks at a time, and the daily window alone would leave its latest query empty
+  # for most of every month.
+  def lookback_days
+    [frequency, publish_cadence].compact.map { |key| LOOKBACK_DAYS.fetch(key) }.max
+  end
+
   def start_date
-    currency_coverages.map { |c| c.start_date.to_s }.min
+    (currency_coverages + currency_exclusions).map { |c| c.start_date.to_s }.min
   end
 
   def end_date
-    currency_coverages.map { |c| c.end_date.to_s }.max
+    (currency_coverages + currency_exclusions).map { |c| c.end_date.to_s }.max
   end
 
   def last_synced
@@ -66,6 +121,8 @@ class Provider < Sequel::Model(:providers)
       count_missed_buckets(cron, last_date, reference_date, :week)
     when "monthly"
       count_missed_buckets(cron, last_date, reference_date, :month)
+    when "quarterly"
+      count_missed_buckets(cron, last_date, reference_date, :quarter)
     else
       raise ArgumentError, "#{key}: unknown publish_cadence #{publish_cadence.inspect}"
     end
@@ -81,15 +138,17 @@ class Provider < Sequel::Model(:providers)
     fetched = false
     adapter.fetch_each(after:) do |records|
       fetched = true
-      RateValidation.reject!(records)
+      RateValidation.reject!(records, lead_days: adapter.lead_days)
       records.each do |r|
         r[:provider] = key
         r[:rate] = RatePrecision.normalize(r[:rate])
       end
+      warn_revisions(records) if adapter.revises?
 
-      inserted = db.transaction do
+      inserted = db.transaction(savepoint: true) do
         before = db.get(Sequel.lit("total_changes()"))
-        Rate.dataset.insert_conflict(target: [:provider, :date, :base, :quote]).multi_insert(records)
+        Rate.dataset.insert_conflict(target: [:provider, :date, :base, :quote])
+          .multi_insert(records.map { |record| RateComponents.attributes(record) })
         count = db.get(Sequel.lit("total_changes()")) - before
         if count.positive?
           affected_currencies = records.flat_map { |r| [r[:base], r[:quote]] }.uniq
@@ -117,6 +176,23 @@ class Provider < Sequel::Model(:providers)
   end
 
   private
+
+  # Insert-only backfill never rewrites a stored row, so a source that revises a published value in place leaves us
+  # holding the old one. Report the drift; the fix is the documented delete-and-refetch.
+  def warn_revisions(records)
+    stored = Rate.where(provider: key, date: records.map { |r| r[:date] }.uniq).as_hash([:date, :base, :quote], :rate)
+    drifted = records.filter_map do |r|
+      value = stored[[r[:date], r[:base], r[:quote]]]
+      [r, value] if value && value != r[:rate]
+    end
+    return if drifted.empty?
+
+    detail = drifted.first(5).map do |r, value|
+      "#{r[:date]} #{r[:base]}/#{r[:quote]} stored #{value} fetched #{r[:rate]}"
+    end
+    noun = drifted.size == 1 ? "1 stored rate differs" : "#{drifted.size} stored rates differ"
+    Log.warn("#{key}: #{noun} from source: #{detail.join(", ")}")
+  end
 
   def count_fire_days(cron, last_date, reference_date)
     count = 0
@@ -150,6 +226,7 @@ class Provider < Sequel::Model(:providers)
     case granularity
     when :week  then date - (date.cwday - 1)
     when :month then Date.new(date.year, date.month, 1)
+    when :quarter then Date.new(date.year, (((date.month - 1) / 3) * 3) + 1, 1)
     end
   end
 
@@ -160,6 +237,7 @@ class Provider < Sequel::Model(:providers)
       cursor = case granularity
                when :week  then cursor + 7
                when :month then cursor.next_month
+               when :quarter then cursor >> 3
                end
       count += 1
     end
@@ -167,29 +245,21 @@ class Provider < Sequel::Model(:providers)
   end
 
   def refresh_rollups(dates)
-    refresh_rollup(:weekly_rates, Bucket.week, dates)
-    refresh_rollup(:monthly_rates, Bucket.month, dates)
+    # Older data migrations load Provider before migration 030 creates these tables. Require the grouped models only
+    # when backfill actually needs them; normal application startup always migrates before starting ingestion.
+    require "blended_weekly_rate"
+    require "blended_monthly_rate"
+
+    weeks = refresh_rollup(:weekly_rates, Bucket.week, dates)
+    months = refresh_rollup(:monthly_rates, Bucket.month, dates)
+    return unless blends?
+
+    BlendedWeeklyRate.refresh(weeks)
+    BlendedMonthlyRate.refresh(months)
   end
 
   def refresh_currency_summaries(iso_codes)
-    iso_codes.each do |code|
-      dates = db[:rates].where(provider: key)
-        .where(Sequel.|({ quote: code }, { base: code }))
-        .select { [min(date).as(start_date), max(date).as(end_date)] }.first # rubocop:disable Performance/Detect
-      next unless dates
-
-      # Upsert coverage with per-provider date range
-      db[:currency_coverages].insert_conflict(target: [:provider_key, :iso_code], update: {
-        start_date: Sequel.function(:min, Sequel[:currency_coverages][:start_date], dates[:start_date]),
-        end_date: Sequel.function(:max, Sequel[:currency_coverages][:end_date], dates[:end_date]),
-      },).insert(provider_key: key, iso_code: code, start_date: dates[:start_date], end_date: dates[:end_date])
-
-      # Upsert global currency date range
-      db[:currencies].insert_conflict(target: :iso_code, update: {
-        start_date: Sequel.function(:min, Sequel[:currencies][:start_date], dates[:start_date]),
-        end_date: Sequel.function(:max, Sequel[:currencies][:end_date], dates[:end_date]),
-      },).insert(iso_code: code, start_date: dates[:start_date], end_date: dates[:end_date])
-    end
+    CurrencySummary.refresh(db, iso_codes, provider: key)
   end
 
   def refresh_rollup(table, bucket_expr, dates)
@@ -198,7 +268,7 @@ class Provider < Sequel::Model(:providers)
       .select_map(bucket_expr)
       .uniq
 
-    return if buckets.empty?
+    return [] if buckets.empty?
 
     db[table].where(provider: key, bucket_date: buckets).delete
 
@@ -210,5 +280,6 @@ class Provider < Sequel::Model(:providers)
         .select(bucket_expr, :provider, :base, :quote, Sequel.function(:avg, :rate))
         .group(:provider, :base, :quote, bucket_expr),
     )
+    buckets
   end
 end

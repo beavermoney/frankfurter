@@ -269,6 +269,29 @@ describe Versions::V2 do
     assert_conform_schema(200)
   end
 
+  # BOA observes a daily fixing but releases a month of them at once, so its newest row can be weeks old with nothing
+  # missed. BOE publishes every day, so a row that old means the feed has stalled.
+  it "carries a daily fixing published in arrears across the wait for the next batch" do
+    Rate.dataset.insert(provider: "BOA", date: Date.today - 20, base: "EUR", quote: "DZD", mid: 145.0)
+
+    get "/providers/boa/rates"
+
+    _(last_response).must_be(:ok?)
+    row = json.find { |r| r["quote"] == "DZD" }
+
+    _(row).wont_be_nil
+    _(row["date"]).must_equal((Date.today - 20).to_s)
+  end
+
+  it "still drops a daily publisher's row after two weeks" do
+    Rate.dataset.insert(provider: "BOE", date: Date.today - 20, base: "EUR", quote: "GBP", mid: 0.86)
+
+    get "/providers/boe/rates"
+
+    _(last_response).must_be(:ok?)
+    _(json).must_be_empty
+  end
+
   it "downsamples by week" do
     get "/rates?from=#{year_start}&to=#{year_end}&group=week"
 
@@ -299,10 +322,25 @@ describe Versions::V2 do
     _(last_response.status).must_equal(422)
   end
 
-  it "returns 422 for invalid dates" do
-    get "/rates?date=not-a-date"
+  it "returns 422 for invalid date, from, and to values" do
+    invalid_dates = [
+      "04-01-1994", "2026-2-03", "2026-02-3", "20260203", "2026-02", "2026-02-03T12:00:00Z",
+      "2026-02-03junk", "2026-02-03\n", "", "not-a-date", "2026-02-30", "2026-02-29",
+    ]
+    ["date", "from", "to"].product(invalid_dates).each do |parameter, value|
+      get "/rates", parameter => value
 
-    _(last_response.status).must_equal(422)
+      assert_equal 422, last_response.status, "#{parameter}=#{value.inspect}"
+      _(Oj.load(last_response.body)["message"]).must_equal("invalid date")
+    end
+  end
+
+  it "accepts a valid leap day for snapshots and ranges" do
+    [{ date: "2000-02-29" }, { from: "2000-02-29", to: "2000-02-29" }].each do |params|
+      get "/rates", params
+
+      _(last_response.status).must_equal(200)
+    end
   end
 
   it "returns an ETag for range queries" do
@@ -364,6 +402,20 @@ describe Versions::V2 do
     _(json["message"]).must_include("split the range")
   end
 
+  it "serves single-provider daily ranges longer than 5 years" do
+    get "/rates?from=2000-01-01&providers=ecb"
+
+    _(last_response).must_be(:ok?)
+    _(json).wont_be_empty
+  end
+
+  it "keeps the cap for multi-provider daily ranges longer than 5 years" do
+    get "/rates?from=2000-01-01&providers=ecb,boc"
+
+    _(last_response.status).must_equal(422)
+    _(json["message"]).must_include("quotes=")
+  end
+
   it "serves plain daily ranges longer than 5 years without any quotes filter" do
     BlendedRate.rebuild
 
@@ -392,6 +444,60 @@ describe Versions::V2 do
     _(last_response.status).must_equal(503)
     assert_conform_schema(503)
     _(json["message"]).must_include("timeout")
+  end
+
+  describe "heavy compute slots" do
+    let(:slots) { HeavySlots.new(1) }
+    let(:heavy_path) { "/rates?providers=ecb&from=#{range_start}&to=#{range_end}" }
+
+    it "returns 503 with Retry-After when every slot is held" do
+      slots.try_acquire
+      Versions::V2::RateQuery.stub(:heavy_slots, slots) do
+        get heavy_path
+      end
+
+      _(last_response.status).must_equal(503)
+      assert_conform_schema(503)
+      _(last_response.headers["Retry-After"]).must_equal("30")
+      _(last_response.headers["Content-Type"]).must_include("application/json")
+      _(json["status"]).must_equal(503)
+      _(json["message"]).must_include("retry")
+    end
+
+    it "serves the range and returns the slot when the stream drains" do
+      Versions::V2::RateQuery.stub(:heavy_slots, slots) do
+        get heavy_path
+      end
+
+      _(last_response).must_be(:ok?)
+      _(json).wont_be_empty
+      _(slots.held).must_equal(0)
+    end
+
+    # Puma closes the body when a client disconnects mid-stream. The enumerator fiber behind the stream is stranded and
+    # never runs its ensure, so the stream's close callback has to return the slot.
+    it "returns the slot when the client disconnects mid-stream" do
+      Versions::V2::RateQuery.stub(:heavy_slots, slots) do
+        _status, _headers, body = app.call(Rack::MockRequest.env_for(heavy_path))
+
+        _(slots.held).must_equal(1)
+
+        body.close
+
+        _(slots.held).must_equal(0)
+      end
+    end
+
+    it "does not touch the slots for table-served ranges" do
+      BlendedRate.rebuild
+      slots.try_acquire
+      Versions::V2::RateQuery.stub(:heavy_slots, slots) do
+        get "/rates?from=#{range_start}&to=#{range_end}"
+      end
+
+      _(last_response).must_be(:ok?)
+      _(json).wont_be_empty
+    end
   end
 
   it "routes deterministic errors in range queries through error_handler" do
@@ -485,6 +591,62 @@ describe Versions::V2 do
     _(usd["iso_numeric"]).must_equal("840")
   end
 
+  it "returns COMESA Dollar as a named accounting unit" do
+    date = Fixtures.latest_date
+    Rate.dataset.multi_insert([
+      { provider: "RBM", date:, base: "CMD", quote: "MWK", mid: 100.0 },
+      { provider: "RBM", date:, base: "USD", quote: "MWK", mid: 90.0 },
+    ])
+    Provider["RBM"].send(:refresh_currency_summaries, ["CMD", "MWK"])
+
+    get "/currency/cmd"
+
+    _(last_response).must_be(:ok?)
+    assert_conform_schema(200)
+    _(json["iso_code"]).must_equal("CMD")
+    _(json["name"]).must_equal("COMESA Dollar")
+    _(json["iso_numeric"]).must_be_nil
+    _(json["providers"]).must_equal(["RBM"])
+    _(json["peg"]).must_equal(
+      "base" => "USD",
+      "rate" => 1.0,
+      "authority" => "Common Market for Eastern and Southern Africa",
+    )
+  end
+
+  it "rejects unsupported currency scopes with or without a provider filter" do
+    ["invalid", "", "ALL", "active"].product([{}, { providers: "ecb" }]).each do |scope, params|
+      get "/currencies", params.merge(scope:)
+
+      assert_equal 422, last_response.status, "scope=#{scope.inspect}, params=#{params.inspect}"
+      _(Oj.load(last_response.body)).must_equal("status" => 422, "message" => "invalid scope")
+      assert_conform_response_schema(422)
+    end
+  end
+
+  it "returns active currencies when scope is omitted" do
+    Currency.create(iso_code: "DEM", start_date: "1999-01-04", end_date: "2001-12-31")
+
+    get "/currencies"
+
+    _(last_response).must_be(:ok?)
+    assert_conform_schema(200)
+    codes = json.map { |c| c["iso_code"] }
+
+    _(codes).must_include("USD")
+    _(codes).wont_include("DEM")
+  end
+
+  it "includes legacy currencies with scope all" do
+    Currency.create(iso_code: "DEM", start_date: "1999-01-04", end_date: "2001-12-31")
+
+    get "/currencies?scope=all"
+
+    _(last_response).must_be(:ok?)
+    assert_conform_schema(200)
+    _(json.map { |c| c["iso_code"] }).must_include("DEM")
+  end
+
   it "returns a single currency" do
     get "/currency/usd"
 
@@ -510,6 +672,17 @@ describe Versions::V2 do
     _(codes).must_include("USD")
     _(codes).must_include("EUR")
     _(codes).wont_include("BMD")
+  end
+
+  it "preserves provider filtering with scope all" do
+    get "/currencies?providers=ecb"
+    expected = last_response.body
+
+    get "/currencies?providers=ecb&scope=all"
+
+    _(last_response).must_be(:ok?)
+    assert_conform_schema(200)
+    _(last_response.body).must_equal(expected)
   end
 
   it "includes base currencies in currencies list" do
@@ -842,5 +1015,143 @@ describe Versions::V2 do
     _(last_response).must_be(:ok?)
     _(json["providers"]).must_be_kind_of(Array)
     _(json).wont_include("peg")
+  end
+
+  it "reports each provider's frequency" do
+    get "/providers"
+
+    _(last_response).must_be(:ok?)
+    _(json.map { |p| p["frequency"] }.uniq).must_equal(["daily"])
+    assert_conform_schema(200)
+  end
+
+  describe "provider routes" do
+    # /providers/<key>/<path> is an alias of /<path>?providers=<key>: same bytes, same headers.
+    def assert_alias(path, query = "", env = {})
+      headers = ["Content-Type", "cache-control", "ETag", "Vary"]
+      sep = query.empty? ? "" : "&"
+      get("/#{path}?providers=ecb#{sep}#{query}", {}, env)
+      canonical = last_response
+      get(query.empty? ? "/providers/ecb/#{path}" : "/providers/ecb/#{path}?#{query}", {}, env)
+
+      _(last_response.status).must_equal(canonical.status)
+      _(last_response.body).must_equal(canonical.body)
+      _(last_response.headers.to_h.slice(*headers)).must_equal(canonical.headers.to_h.slice(*headers))
+    end
+
+    it "serves latest rates" do
+      assert_alias("rates")
+      _(last_response).must_be(:ok?)
+      assert_conform_schema(200)
+    end
+
+    it "serves a specific date" do
+      assert_alias("rates", "date=#{historical_date}")
+      assert_conform_schema(200)
+    end
+
+    it "serves a date range" do
+      assert_alias("rates", "from=#{range_start}&to=#{range_end}")
+      assert_conform_schema(200)
+    end
+
+    it "rebases and filters quotes" do
+      assert_alias("rates", "base=USD&quotes=EUR,GBP")
+      assert_conform_schema(200)
+    end
+
+    it "serves weekly rollups" do
+      assert_alias("rates", "from=#{year_start}&to=#{year_end}&group=week")
+      assert_conform_schema(200)
+    end
+
+    it "serves CSV" do
+      assert_alias("rates.csv", "from=#{range_start}&to=#{range_end}")
+      _(last_response.content_type).must_include("text/csv")
+    end
+
+    it "serves NDJSON" do
+      assert_alias("rates", "from=#{range_start}&to=#{range_end}", { "HTTP_ACCEPT" => "application/x-ndjson" })
+      _(last_response.content_type).must_include("application/x-ndjson")
+    end
+
+    it "serves a single pair" do
+      assert_alias("rate/EUR/USD")
+      _(json["base"]).must_equal("EUR")
+      assert_conform_schema(200)
+    end
+
+    it "serves a single pair on a date" do
+      assert_alias("rate/EUR/USD", "date=#{historical_date}")
+      _(json["date"]).must_equal(historical_date)
+    end
+
+    it "serves a single provider entry" do
+      get "/providers"
+      entry = Oj.load(last_response.body).find { |p| p["key"] == "ECB" }
+      get "/providers/ecb"
+
+      _(last_response).must_be(:ok?)
+      _(Oj.load(last_response.body)).must_equal(entry)
+      assert_conform_schema(200)
+    end
+
+    it "returns 404 for an unknown provider entry" do
+      get "/providers/nope"
+
+      _(last_response.status).must_equal(404)
+    end
+
+    it "is case-insensitive on the provider key" do
+      get "/providers/ecb/rates"
+      lower = last_response.body
+      get "/providers/ECB/rates"
+
+      _(last_response.body).must_equal(lower)
+    end
+
+    it "returns 404 for an unknown provider" do
+      get "/providers/nope/rates"
+
+      _(last_response.status).must_equal(404)
+      assert_conform_schema(404)
+    end
+
+    it "returns 404 for a pair the provider cannot derive" do
+      get "/providers/boc/rate/CAD/SEK"
+
+      _(last_response.status).must_equal(404)
+    end
+
+    it "rejects a providers param" do
+      get "/providers/ecb/rates?providers=boc"
+
+      _(last_response.status).must_equal(422)
+      _(json["message"]).must_include("providers")
+    end
+  end
+
+  describe "trailing path segments" do
+    [
+      "/rates",
+      "/rate/EUR/USD",
+      "/currency/usd",
+      "/currencies",
+      "/providers/ecb/rates",
+      "/providers/ecb/rate/EUR/USD",
+    ].each do |path|
+      it "rejects #{path}/latest and #{path}/" do
+        get path
+
+        _(last_response).must_be(:ok?)
+
+        ["#{path}/latest", "#{path}/"].each do |extra|
+          get extra
+
+          _(last_response.status).must_equal(404)
+          _(json).must_equal("status" => 404, "message" => "not found")
+        end
+      end
+    end
   end
 end

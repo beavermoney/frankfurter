@@ -1,10 +1,13 @@
 # frozen_string_literal: true
 
 require "sequel"
+require "rate_components"
 
 url = ENV.fetch("DATABASE_URL") do
   env = ENV["APP_ENV"]
-  db_name = env ? "frankfurter_#{env}" : "frankfurter"
+  worker = ENV["TEST_ENV_NUMBER"]
+  suffix = worker && !worker.empty? ? "_#{worker}" : ""
+  db_name = env ? "frankfurter_#{env}#{suffix}" : "frankfurter"
   "sqlite://#{Dir.pwd}/db/#{db_name}.sqlite3"
 end
 
@@ -23,7 +26,9 @@ connect_sqls = [
 
 DB = Sequel.connect(
   url,
-  after_connect: proc { |conn| conn.busy_handler_timeout = busy_timeout_ms },
+  after_connect: proc do |conn|
+    conn.busy_handler_timeout = busy_timeout_ms
+  end,
   connect_sqls:,
   max_connections:,
 )
