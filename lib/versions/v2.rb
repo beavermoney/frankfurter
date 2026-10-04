@@ -53,6 +53,16 @@ module Versions
       r.is { ROOT_PAYLOAD }
       r.root { ROOT_PAYLOAD }
 
+      r.is("coverage") do
+        r.get do
+          unknown = r.params.keys - RateCoverage::PARAMS
+          raise RateQuery::ValidationError, "unknown parameter: #{unknown.join(", ")}" if unknown.any?
+
+          response.cache_control(public: true, max_age: 3600)
+          RateQuery.new(r.params).coverage
+        end
+      end
+
       r.is("rates") do
         r.get { rates_response(r.params) }
       end
@@ -122,6 +132,8 @@ module Versions
       request.etag(query.cache_key)
 
       request.csv do
+        # Browsers ignore <a download> on cross-origin links, so the header is what makes a linked CSV download.
+        response["Content-Disposition"] = %(attachment; filename="#{query.csv_filename}")
         if query.range?
           first, rest = eager_split(query)
           response["Content-Type"] = "text/csv"

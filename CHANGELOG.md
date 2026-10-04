@@ -7,8 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.1] - 2026-10-02
+
+### Changed
+
+- Retired currencies use CLDR names with year ranges instead of '(old)'. (#742)
+
+### Fixed
+
+- Backfill no longer skips a day at each window boundary. (#739)
+- National Bank of the Kyrgyz Republic backfills up to today. (#739)
+- Retired and non-ISO currency labels in CBU, BOTA, NBP and BOI history. (#740)
+- Bank of Israel pre-euro rates published per 10, 100 or 1000 units. (#740)
+- Legacy currencies quoted past their redenomination. (#740)
+- Banca d'Italia's old afghani quotes, labelled AFN until April 2004. (#741)
+- Czech National Bank backfill no longer fails when a window holds whole years. (#743)
+- HMRC, IMF, DNB, MAS and CBAR full backfills no longer fail at their coverage start. (#744)
+- Successor currencies quoted under retired codes in NBU, BNA, BAM, BDI, CBG, CBU, LB, NBP and BOTA history. (#745)
+- National Bank of the Kyrgyz Republic no longer re-dates its frozen BYR rate each week. (#745)
+- National Bank of the Republic of North Macedonia's ECU quotes, labelled XBA until May 1999. (#747)
+- National Bank of the Republic of Belarus history from July 2016. (#748)
+- Bulgarian lev rates from the National Bank of the Republic of Belarus, to December 2025. (#748)
+- National Bank of Kazakhstan history from November 1999. (#748)
+- Bank of Tanzania history from June 1999. (#748)
+- Full backfills keep the first days of CBAR, HNB and BCCH history. (#748)
+- Banco Central de Costa Rica history from 1983. (#750)
+- One-day provider typos no longer skew blends. (#749)
+- Bank of Lithuania's old zloty, ruble, lev, leu and metical quotes, labelled with the new codes. (#751)
+- Central Bank of Armenia history for the currencies it no longer quotes. (#751)
+- Central Bank of Armenia's pre-2005 tenge and 2000 Tajik ruble rates, published per 10 or 100 units. (#751)
+- Finnish markka, Greek drachma, litas, lats and koruna no longer blend past their euro changeover. (#751)
+- Old Belarusian ruble quotes labelled BYN in National Bank of Kazakhstan and Central Bank of Armenia history. (#752)
+- Central Bank of Armenia's Romanian leu from October 2005 and Turkmen manat from April 2010. (#753)
+- Bank of Lithuania history from June 1993. (#754)
+- Bank of Lithuania history for the retired currencies it quoted. (#754)
+- Bank of Lithuania's 1995 Turkmen manat rows that repeat its Russian ruble rate. (#754)
+- Bank of Lithuania's Belarusian ruble rates before the August 1994 denomination. (#754)
+- Autoridade Monetária de Macau's interest rate, stored as a currency LIQ to October 2012. (#762)
+- Czech National Bank's 1991 Belgian franc and dinar quotes, labelled BEC and YUD. (#762)
+- Czech National Bank's clearing ECU (XCU) of 1993 to 1995, missing from the currency catalogue. (#762)
+- Natsionalnyi Bank Ukrainy's somoni quotes, labelled ZAL from November 2000 to November 2002. (#762)
+
+Existing installs keep the days the old backfill skipped, since backfill resumes from the newest stored date. Run
+`bundle exec rake backfill FULL=1` once after upgrading to fill them; it refetches from each provider's coverage start
+and skips rows already stored, so it is safe but slow.
+
+Blends keep their old values for the relabelled history and the screened typos until rebuilt. Run
+`bundle exec rake blend:rebuild` once after upgrading; it rebuilds in place, so queries keep reading the tables while it
+runs.
+
+## [2.6.0] - 2026-09-30
+
 ### Added
 
+- CSV downloads named after the query.
+- Query-specific history coverage. (#730)
+- Japan Customs (JPC) as a data provider. (#715)
+- Banky Foiben'i Madagasikara (BFM) as a data provider. (#400)
+- Bank of Mauritius (BOMU) as a data provider. (#370)
+- Central Bank of Bosnia and Herzegovina (CBBH) as a data provider. (#376)
+- European Commission (INFOREURO) as a data provider. (#713)
+- Bank for International Settlements (BIS) as a data provider. (#714)
 - COMESA Dollar (CMD) peg. (#706)
 - RBA trade-weighted index on provider routes. (#695)
 - COMESA Dollar (CMD). (#699)
@@ -16,6 +75,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- National Bank of Moldova backfills on fresh installs, skipping days without metal prices. (#733)
+- Provider-filtered currency lists and coverage dates. (#728)
+- Reserve Bank of Malawi Special Drawing Rights quotes as XDR. (#708)
+- Bank Negara Malaysia Special Drawing Rights quotes as XDR. (#709)
 - Reserve Bank of Australia Special Drawing Rights quotes as XDR. (#704)
 - Non-currency series excluded from multi-provider blends. (#698)
 - Ecuadorian sucre metadata and retirement cutoff. (#697)
@@ -256,7 +319,9 @@ New multi-provider API at `/v2/`. The v1 API is unchanged and remains available 
 - Migrated database storage from PostgreSQL to SQLite.
 - Moved domain to <https://api.frankfurter.dev>.
 
-[Unreleased]: https://github.com/lineofflight/frankfurter/compare/v2.5.1...HEAD
+[Unreleased]: https://github.com/lineofflight/frankfurter/compare/v2.6.1...HEAD
+[2.6.1]: https://github.com/lineofflight/frankfurter/compare/v2.6.0...v2.6.1
+[2.6.0]: https://github.com/lineofflight/frankfurter/compare/v2.5.1...v2.6.0
 [2.5.1]: https://github.com/lineofflight/frankfurter/compare/v2.5.0...v2.5.1
 [2.5.0]: https://github.com/lineofflight/frankfurter/compare/v2.4.0...v2.5.0
 [2.4.0]: https://github.com/lineofflight/frankfurter/compare/v2.3.5...v2.4.0

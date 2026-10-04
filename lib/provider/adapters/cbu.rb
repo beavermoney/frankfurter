@@ -18,6 +18,16 @@ class Provider
         "RUB" => ["RUR", Date.new(1998, 1, 6)],
       }.freeze
 
+      # The TRL label outlives the 2005 redenomination: 1 "TRL" = 0.00078 UZS on 2004-12-28 and 787.09 in the next
+      # bulletin on 2005-01-04. From then on it carries the new lira, alongside TRY from 2009 and alone until 2010.
+      SUCCESSORS = {
+        "TRL" => ["TRY", Date.new(2005, 1, 4)],
+      }.freeze
+
+      # Bulletins up to 2008-09-16 list the SDR under its own label (code 001). That day's bulletin also carries XDR
+      # (code 960) at the same rate, and later ones only XDR.
+      ALIASES = { "SDR" => "XDR" }.freeze
+
       class << self
         def backfill_range = 30
       end
@@ -53,7 +63,7 @@ class Provider
 
           date = Date.strptime(row["Date"], "%d.%m.%Y")
 
-          { date:, base: historical_code(code, date), quote: "UZS", rate: rate / nominal }
+          { date:, base: historical_code(ALIASES.fetch(code, code), date), quote: "UZS", rate: rate / nominal }
         end
       end
 

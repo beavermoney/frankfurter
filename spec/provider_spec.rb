@@ -29,7 +29,7 @@ describe Provider do
         _(data).wont_include("publish_time")
         _(data).wont_include("publish_days")
         _([nil, "daily", "weekly", "monthly", "quarterly"]).must_include(data["publish_cadence"])
-        _([nil, "daily", "monthly", "quarterly"]).must_include(data["frequency"])
+        _([nil, "daily", "weekly", "monthly", "quarterly"]).must_include(data["frequency"])
         _(data["publish_cadence"].nil?).must_equal(data["publish_schedule"].nil?)
         next if data["publish_schedule"].nil?
 
@@ -358,6 +358,39 @@ describe Provider do
       _(Rate.where(provider: provider.key, date: import_date).count).must_equal(1)
     end
 
+    describe "from coverage_start" do
+      let(:coverage_start) { Date.today - 10 }
+
+      it "fetches the coverage start day on a first backfill" do
+        exclusive_adapter = Class.new(Provider::Adapters::Adapter) do
+          define_method(:fetch) do |after: nil, upto: nil|
+            ((after + 1)..(upto || Date.today)).map { |date| { date:, base: "EUR", quote: "USD", rate: 1.1 } }
+          end
+        end
+
+        provider.stub(:coverage_start, coverage_start) do
+          provider.stub(:adapter, exclusive_adapter) { provider.backfill }
+        end
+
+        _(Rate.where(provider: provider.key).min(:date)).must_equal(coverage_start.to_s)
+      end
+
+      it "stores nothing dated before coverage_start" do
+        # An adapter that reads after as inclusive also returns the day before coverage_start.
+        stray_adapter = Class.new(Provider::Adapters::Adapter) do
+          define_method(:fetch) do |after: nil, upto: nil|
+            (after..(upto || Date.today)).map { |date| { date:, base: "EUR", quote: "USD", rate: 1.1 } }
+          end
+        end
+
+        provider.stub(:coverage_start, coverage_start) do
+          provider.stub(:adapter, stray_adapter) { provider.backfill(after: coverage_start) }
+        end
+
+        _(Rate.where(provider: provider.key).min(:date)).must_equal(coverage_start.to_s)
+      end
+    end
+
     describe "when the adapter revises published values in place" do
       # HMRC may correct a monthly customs rate mid-month. If the correction replaces the row in its file rather than
       # adding one with a later start date, insert-only backfill keeps the stale figure. Surface the drift.
@@ -614,6 +647,36 @@ describe Provider do
       end
 
       _(BlendedRate.where(date: import_date).count).must_be(:>, 0)
+    end
+
+    { "weekly" => "JPC", "monthly" => "BIS" }.each do |frequency, key|
+      describe "with #{frequency} observations" do
+        let(:provider) { Provider[key].dup }
+        let(:import_date) { Date.new(2025, 1, 31) }
+
+        it "imports source history and coverage without refreshing daily blends" do
+          refreshed = []
+          purged = false
+          BlendedRate.stub(:refresh, ->(window) { refreshed << window }) do
+            Cache.stub(:purge_debounced, -> { purged = true }) do
+              provider.stub(:adapter, adapter) { provider.backfill }
+            end
+          end
+
+          _(refreshed).must_be_empty
+          _(Rate.where(provider: key, date: import_date).first.rate).must_equal(1.1)
+          _(WeeklyRate.where(provider: key, bucket_date: "2025-01-29").first.rate).must_equal(1.1)
+          _(MonthlyRate.where(provider: key, bucket_date: "2025-01-01").first.rate).must_equal(1.1)
+          coverages = CurrencyCoverage.where(provider_key: key).order(:iso_code)
+
+          _(coverages.select_map(:iso_code).join(",")).must_equal("EUR,USD")
+          coverages.each do |coverage|
+            _(coverage.start_date).must_equal(import_date)
+            _(coverage.end_date).must_equal(import_date)
+          end
+          _(purged).must_equal(true)
+        end
+      end
     end
 
     it "does not request a cache purge when no new rates are inserted" do

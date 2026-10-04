@@ -74,6 +74,31 @@ class Provider < Sequel::Model(:providers)
         _(records.first[:rate]).must_be_close_to(0.01346, 1e-9)
       end
 
+      it "relabels the new lira published under TRL" do
+        json = <<~JSON
+          [
+            {"id":1,"Code":"792","Ccy":"TRL","CcyNm_EN":"Turkish Lira","Nominal":"1","Rate":"0.00078","Diff":"0","Date":"28.12.2004"},
+            {"id":1,"Code":"792","Ccy":"TRL","CcyNm_EN":"Turkish Lira","Nominal":"1","Rate":"787.09","Diff":"0","Date":"04.01.2005"}
+          ]
+        JSON
+        records = adapter.parse(json)
+
+        _(records.map { |r| [r[:base], r[:rate]] }).must_equal([["TRL", 0.00078], ["TRY", 787.09]])
+      end
+
+      it "maps the SDR label to XDR" do
+        json = <<~JSON
+          [
+            {"id":1,"Code":"001","Ccy":"SDR","CcyNm_EN":"Special Drawing Rights","Nominal":"1","Rate":"2044.11","Diff":"","Date":"16.09.2008"},
+            {"id":22,"Code":"960","Ccy":"XDR","CcyNm_EN":"Special Drawing Rights","Nominal":"1","Rate":"2044.11","Diff":"","Date":"16.09.2008"}
+          ]
+        JSON
+        records = adapter.parse(json)
+
+        _(records.map { |r| r[:base] }).must_equal(["XDR", "XDR"])
+        _(records.map { |r| r[:rate] }.uniq).must_equal([2044.11])
+      end
+
       it "skips invalid currency codes" do
         json = <<~JSON
           [{"id":1,"Code":"999","Ccy":"XX","CcyNm_EN":"Invalid","Nominal":"1","Rate":"1.5","Diff":"0","Date":"01.04.2026"}]

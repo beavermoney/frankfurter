@@ -30,6 +30,15 @@ class Provider < Sequel::Model(:providers)
         _(sample.size).must_be(:>, 1)
       end
 
+      it "returns rows when every fetched row is in range" do
+        rows = [{ date: Date.new(1991, 1, 2), base: "USD", quote: "CZK", rate: 28.0 }]
+        dataset = adapter.stub(:fetch_year, ->(year) { year == 1991 ? rows : [] }) do
+          adapter.fetch(after: Date.new(1990, 12, 31), upto: Date.new(1991, 12, 31))
+        end
+
+        _(dataset).must_equal(rows)
+      end
+
       it "parses JSON with correct base and quote" do
         json = {
           "rates" => [
@@ -68,6 +77,47 @@ class Provider < Sequel::Model(:providers)
         records = adapter.parse(json)
 
         _(records.first[:rate]).must_be_close_to(0.001256, 0.000001)
+      end
+
+      it "reads the convertible Belgian franc as BEF" do
+        json = {
+          "rates" => [
+            { "validFor" => "1991-01-24", "currencyCode" => "BEC", "amount" => 100, "rate" => 88.99 },
+            { "validFor" => "1991-01-24", "currencyCode" => "LUF", "amount" => 100, "rate" => 88.99 },
+            { "validFor" => "1991-01-25", "currencyCode" => "BEF", "amount" => 100, "rate" => 89.31 },
+          ],
+        }
+
+        records = adapter.parse(json)
+
+        _(records.map { |r| r[:base] }).must_equal(["BEF", "LUF", "BEF"])
+        _(records.first[:rate]).must_be_close_to(0.8899, 1e-9)
+      end
+
+      it "reads the 1991 dinar as the convertible dinar" do
+        json = {
+          "rates" => [
+            { "validFor" => "1991-01-03", "currencyCode" => "YUD", "amount" => 1, "rate" => 2.04 },
+          ],
+        }
+
+        records = adapter.parse(json)
+
+        _(records.first[:base]).must_equal("YUN")
+        _(records.first[:rate]).must_equal(2.04)
+      end
+
+      it "keeps the clearing ECU apart from the ECU" do
+        json = {
+          "rates" => [
+            { "validFor" => "1993-03-10", "currencyCode" => "XEU", "amount" => 1, "rate" => 34.118 },
+            { "validFor" => "1993-03-10", "currencyCode" => "XCU", "amount" => 1, "rate" => 33.436 },
+          ],
+        }
+
+        records = adapter.parse(json)
+
+        _(records.map { |r| [r[:base], r[:rate]] }).must_equal([["XEU", 34.118], ["XCU", 33.436]])
       end
 
       it "skips records with zero rate" do

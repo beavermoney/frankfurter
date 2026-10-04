@@ -69,6 +69,30 @@ class Provider < Sequel::Model(:providers)
         ])
       end
 
+      it "maps the MXM label to the old metical" do
+        html = <<~HTML
+          <table><tbody>
+          <tr><td>757</td><td>MXM</td><td>0.0599</td><td>0.0605</td><td>0.0602</td><td>01-Jul-99</td></tr>
+          </tbody></table>
+        HTML
+
+        _(adapter.parse(html)).must_equal([
+          { date: Date.new(1999, 7, 1), base: "MZM", quote: "TZS", rate: 0.0602 },
+        ])
+      end
+
+      it "relabels the kwacha published under ZMK" do
+        html = <<~HTML
+          <table><tbody>
+          <tr><td>40</td><td>ZMK</td><td>111.1036</td><td>112.2202</td><td>111.6619</td><td>21-Jun-25</td></tr>
+          </tbody></table>
+        HTML
+
+        _(adapter.parse(html)).must_equal([
+          { date: Date.new(2025, 6, 21), base: "ZMW", quote: "TZS", rate: 111.6619 },
+        ])
+      end
+
       it "excludes GOLD and defunct currencies" do
         html = <<~HTML
           <html><body>
